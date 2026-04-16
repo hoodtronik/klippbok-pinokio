@@ -249,6 +249,330 @@ you explicitly save (coming in the next polish step).
 
 If anything's unclear, the exact CLI help for every subcommand is in
 `docs/cli_help.txt` at the repo root — regenerated on every install.
+
+There's also a full beginner walkthrough further down this page —
+**Explained Like You're 5**. Scroll down if any of the above felt
+too dense.
+
+---
+
+## Explained Like You're 5 — full beginner walkthrough
+
+No jargon. Step by step. From zero folder on your disk to a folder your
+LoRA trainer will accept.
+
+Two recipes below:
+- **Image LoRA** — you want the model to learn a face, a style, or a
+  specific object in still images.
+- **Video LoRA** — you want the model to learn motion (walking,
+  dancing, camera moves, a specific animated character's movement).
+
+Before picking a recipe, decide what you're training.
+
+### First: what kind of LoRA are you making?
+
+| You want the model to learn… | Collect… | How many | Image or Video? |
+|---|---|---|---|
+| A specific person / character | Photos or stills of that person | 15–50 | Either |
+| An art style (cinematic, anime, oil-paint) | Images sharing that aesthetic | 20–80 | Either |
+| A camera move or body motion | Clips showing the motion clearly | 10–30 | **Video** |
+| A specific object (a car model, a logo, a product) | Shots of the object in varied contexts | 15–40 | Either |
+
+**Go with Image LoRA if you're new to this.** It's faster to collect
+data for, faster to train, and easier to debug when something goes
+wrong. Video LoRAs teach *motion* — you need actual video clips and
+you'll spend more time curating. Come back for video once you've
+trained a couple of image LoRAs.
+
+---
+
+### Recipe 1 — Image LoRA (person / style / object)
+
+You have a pile of reference images. You want one LoRA that learns
+the thing.
+
+#### Step 1 — Make the folders
+
+1. Click the **Project** tab at the top.
+2. Open the **Scaffold a new project layout** accordion near the
+   bottom.
+3. Hit **Browse…** and pick where your LoRA projects live (example:
+   `D:/LoRA-Projects`).
+4. Give it a name in the **Project name** box (example: `MyCharacter`).
+5. Click **Create project folders**.
+
+You now have three folders inside `D:/LoRA-Projects/MyCharacter`:
+`clips/`, `concepts/`, `output/`. The three path boxes at the top
+of the Project tab auto-filled with the new paths.
+
+#### Step 2 — Put your images in `clips/`
+
+- Open the `clips/` folder in your file explorer.
+- Drag your jpg/png reference images in.
+- The folder is named "clips" because Klippbok was built for video,
+  but it handles images too — no renaming needed.
+
+#### Step 3 — Skip triage, go straight to Caption
+
+For a single-subject image LoRA, triage is overkill. Jump to Step 4.
+(If you have one folder with *multiple* characters mixed together and
+want to auto-separate them, come back and look at **Triage** + the
+**Manifest Reviewer** — that's what they're for. For a clean
+single-subject set, skip.)
+
+#### Step 4 — Set your API key
+
+1. Click the **Settings** tab (last tab in the strip).
+2. Paste a Gemini API key into the **GEMINI_API_KEY** box.
+   Free key here: https://aistudio.google.com/apikey
+3. Click **Save to .env** so it sticks between sessions.
+
+If you don't want to use Gemini, Replicate or a local Ollama server
+also work — see the Settings/API keys section above.
+
+#### Step 5 — Generate captions
+
+1. Click the **Caption** tab.
+2. The Directory auto-fills with your `clips/` path. Leave it.
+3. `--provider` = `gemini`.
+4. `--use-case` = pick the one that matches:
+   - `character` for a person
+   - `style` for an aesthetic
+   - `object` for a thing
+5. `--anchor-word` — a short name you'll type when prompting the
+   trained model. Examples: `jane`, `mystyle`, `widget1`.
+6. Click **Run**.
+
+Watch the log. You'll see one line per image as Klippbok captions
+it. When you see `[exit=0  elapsed=Ns]`, it's done and one `.txt`
+file sits next to every image.
+
+#### Step 6 — Sanity-check the captions
+
+1. Click the **Score** tab. Run it. It checks caption length, token
+   variety, and anchor-word presence. Read the report.
+2. If scores look bad, go back to **Caption** with `--overwrite`
+   checked and try a different `--use-case`.
+
+#### Step 7 — Validate the dataset
+
+1. Click the **Validate** tab.
+2. Check `--quality` and `--duplicates`.
+3. Run.
+4. Read the report carefully:
+   - **Errors** — fix before moving on (missing captions, unreadable
+     files, impossible dimensions).
+   - **Warnings** — judgment call. Usually fine to proceed.
+
+#### Step 8 — Organize for your trainer
+
+1. Click the **Organize** tab.
+2. `--output` — pick or type a fresh empty folder (like
+   `D:/LoRA-Projects/MyCharacter/for-training`).
+3. `--trainer` — for image LoRAs, pick `aitoolkit` (most common).
+   For musubi-tuner, pick `musubi`. You can pick both; they go into
+   separate subfolders.
+4. Click **Run**.
+
+Done. The `--output` folder is now laid out exactly the way your
+trainer expects. Feed it into ai-toolkit / kohya / musubi-tuner and
+hit train.
+
+---
+
+### Recipe 2 — Video LoRA (motion / animated character)
+
+You have raw video files. You want to teach a model how something
+moves.
+
+#### Step 1 — Make the folders
+
+Same as image LoRA:
+1. **Project** tab → **Scaffold a new project layout** → pick parent,
+   name it, click **Create project folders**.
+2. Three path boxes auto-fill.
+
+#### Step 2 — Put raw videos in `clips/`
+
+- Drop your `.mp4`, `.mov`, or `.mkv` files into `clips/`.
+- Long videos are fine — Klippbok will auto-split them into scenes in
+  Step 5.
+- Aim for source material that shows the motion clearly without much
+  other stuff happening. A 30-second clip of someone dancing beats a
+  5-minute clip where they dance for 10 seconds.
+
+#### Step 3 — Scan your videos
+
+1. Click the **Scan** tab. Run it.
+2. Read the report. The numbers you care about:
+   - **Clips scanned** — how many Klippbok saw.
+   - **Unusable: N** — clips Klippbok will refuse to process (wrong
+     format, zero frames, etc.). If this is most of them, find better
+     source.
+   - **Normalize recommended: N** — clips that need fps or resolution
+     fixes. Klippbok will handle this later; just note the count.
+   - Issue lines like `RESOLUTION_BELOW_TARGET` — clips smaller than
+     the training target (720p by default). The model can't learn
+     detail that isn't in the source, so consider dropping these if
+     you can.
+
+**Proceed** to the next step if most of your clips are scannable.
+**Stop and find better source** if most are unusable.
+
+#### Step 4 — Populate the Concepts folder
+
+This is the one step nobody can do for you.
+
+1. Open the `concepts/` folder in your file explorer.
+2. Make a subfolder for each thing you want to match on. Examples:
+   - `jane_dancing/` (one character doing one motion)
+   - `cinematic/` (a lighting/camera style)
+   - `slow_pan/` (a specific camera move)
+3. Drop **5–20 reference images** (jpg/png, not video) into each
+   subfolder. These can be:
+   - Stills from your best source video (use Snipping Tool, Photoshop,
+     anything).
+   - Web images.
+   - AI-generated reference images.
+4. Keep the set varied — different angles, lighting, moments. CLIP
+   averages your references when matching, so diversity = better
+   matches.
+
+#### Step 5 — Run Triage
+
+1. Click the **Triage** tab.
+2. Directory auto-fills from Project. `--concepts` too.
+3. Click **Run**.
+4. Expect this to take a while. Klippbok:
+   - Scene-detects long videos into short scenes (if they're long).
+   - Downloads the CLIP model on first run (~150MB, cached after).
+   - Compares every scene against every concept reference.
+5. When it finishes you'll see a summary in the log and a
+   `triage_manifest.json` (short clips) or `scene_triage_manifest.json`
+   (long videos, one manifest for all scenes) gets written.
+
+#### Step 6 — Review the manifest
+
+This is the payoff. CLIP is smart but wrong sometimes. You fix it.
+
+1. Click **Manifest Reviewer**. The path auto-fills from Step 5.
+2. Click **Load**.
+3. Wait a few seconds for the first page's thumbnails.
+4. **Do bulk first, then clean up by hand.**
+   - Drag the **threshold slider** to ~0.75. Click **Include where
+     score ≥ threshold**. High-confidence matches stay. Everything
+     else gets excluded.
+   - Click **Exclude clips with text overlay**. Drops subtitled /
+     watermarked / UI-capture clips (Klippbok flagged them during
+     Triage).
+5. **Then page through.** For each row:
+   - Look at the thumbnail.
+   - Does it really show the concept listed (top-right of the
+     metadata)?
+   - If yes and it's excluded → tick Include.
+   - If no and it's included → untick Include.
+6. Click **Save**. You get `<name>_reviewed.json` alongside the
+   original. Your raw Triage output stays untouched.
+
+**Don't skip this step.** Training on bad matches ruins the LoRA.
+
+#### Step 7 — Ingest using the reviewed manifest
+
+1. Click the **Ingest** tab.
+2. Directory auto-fills with your raw video location.
+3. `--output` auto-fills with your `output/` folder.
+4. Paste the path to the **reviewed** manifest into `--triage`.
+5. Click **Run**.
+
+Klippbok scene-splits your raw videos — **but only the scenes you
+kept in the Reviewer** — and writes trainable clips into `output/`.
+
+#### Step 8 — Caption
+
+1. **Settings** tab: paste API key (Gemini recommended) and Save to
+   .env.
+2. **Caption** tab:
+   - Directory — point at your `output/` folder (where Ingest wrote
+     the clips).
+   - `--provider` = `gemini`.
+   - `--use-case` = match what you're training (`motion`, `character`,
+     `style`, or `object`).
+   - `--anchor-word` = short identifier you'll use at prompt time.
+3. Click **Run**. Watch as Klippbok writes one `.txt` per clip.
+
+#### Step 9 — Score and Audit
+
+1. **Score** tab: run against your `output/` folder. Fast, local.
+2. **Audit** tab (optional): run with `--mode save_audit`. Re-captions
+   with VLM and compares to existing. Tells you if caption quality
+   drifted.
+
+If Score looks bad, re-run Caption with a different provider or
+use-case.
+
+#### Step 10 — Validate + Organize
+
+1. **Validate** tab: check `--buckets`, `--quality`, `--duplicates`.
+   Run. Fix errors. Judge warnings.
+2. **Organize** tab:
+   - `--output` — pick a fresh empty folder for the final trainer-ready
+     layout.
+   - `--trainer` — `musubi` for musubi-tuner (most video trainers) or
+     `aitoolkit` if you're using that. Both works.
+3. Click **Run**.
+
+Done. The Organize output folder is what you hand to your trainer.
+
+---
+
+### Reading the log output
+
+Every command tab streams stdout into the log pane. You care about:
+
+- Lines like `Scanning: /path` or `Matching scene 3/47…` — progress.
+  Keep watching, things are happening.
+- `[exit=0  elapsed=N.Ns]` at the end — success. **Proceed** to the
+  next tab in the pipeline.
+- `[exit=1]` or any non-zero exit — failure. The lines above explain
+  why. The three most common reasons:
+  - `Directory not found` — typo, or the path needs `/` instead of `\`.
+  - `No video files found` — nothing in the folder, or the extensions
+    are ones Klippbok doesn't support.
+  - `ImportError` / `CUDA out of memory` — GPU or environment issue
+    (rare in Pinokio). Try re-running; if persistent, click **Reset**
+    in Pinokio and re-install.
+- Mid-run `[WARN]` — informational, the run continues.
+- Mid-run `[ERROR]` — one item failed but the command may still
+  succeed. Check the final summary.
+
+### When to proceed vs re-run
+
+- **Scan** — proceed as long as you have more than zero usable clips.
+- **Triage** — **do not** proceed past this without reviewing in the
+  Manifest Reviewer. CLIP gets things wrong.
+- **Ingest** — open your output folder. If there are clips in it,
+  proceed. If it's empty, check the log for errors and fix.
+- **Caption** — open a few `.txt` files. Do they make sense? Is the
+  anchor word in there? If no, re-run with `--overwrite` and tweak
+  use-case or provider.
+- **Validate** — fix everything labeled `ERROR`. Warnings are
+  judgment calls (a few low-res clips in a 200-clip set is probably
+  fine).
+- **Organize** — final step. If it succeeds, you're done.
+
+### Common first-timer mistakes
+
+- **Empty `concepts/` folder, then running Triage.** The Triage tab
+  refuses to launch with a clear message pointing here. Populate
+  concepts first.
+- **Using video files as concept references.** Concepts holds
+  *images*. Grab stills from your best clips.
+- **Skipping the Manifest Reviewer.** Don't. It's the whole reason
+  this UI exists.
+- **Training on a dataset without Validate passing.** You'll waste
+  GPU time debugging things Klippbok would have caught.
+- **Forgetting to set `--anchor-word`.** Without it, the model has
+  no stable token to learn — prompting it later won't work well.
 """
 
 
