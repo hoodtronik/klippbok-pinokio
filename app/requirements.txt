@@ -1,5 +1,8 @@
-# Step 2 — only Gradio so the install is fast enough for a smoke test loop.
-# Step 3 will add:
-#   klippbok[all]  # pulls torch, transformers, scenedetect, opencv, google-genai, pydantic, rich
-#   pillow>=10.0   # used by the Manifest Reviewer thumbnail cache
+# UI
 gradio>=5.0,<6.0
+pillow>=10.0
+
+# Klippbok itself — pulls torch, transformers, scenedetect, opencv-python,
+# google-genai, pydantic, rich. The torch.js installer runs immediately after
+# this (see install.js) to swap in a GPU-appropriate torch build when possible.
+klippbok[all]
