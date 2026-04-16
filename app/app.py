@@ -11,11 +11,263 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 from typing import Iterator
 
 import gradio as gr
 
 import runner
+
+
+# ----- long-form constants (markdown blocks, readme text) ------------------
+
+CONCEPTS_README = """\
+Klippbok Concepts Folder
+========================
+
+This folder holds reference images that teach Klippbok what each concept
+looks like. Each subfolder = one concept. Klippbok's Triage stage matches
+your video clips against these references.
+
+Quick start
+-----------
+1. Create a subfolder for each concept you want to match on — a character,
+   a style, a camera motion, an object. Use short, lowercase names — they
+   become the labels in the triage manifest.
+
+     concepts/
+       my_character/
+         ref_01.jpg
+         ref_02.jpg
+         ...
+       cinematic_style/
+         ref_01.jpg
+         ...
+
+2. Drop 5-20 representative jpg or png images into each subfolder. Variety
+   (different poses, lighting, angles) helps CLIP build a robust match.
+
+3. Run the Triage tab in the Klippbok UI. Then Manifest Reviewer to fix
+   anything CLIP got wrong.
+
+Klippbok does NOT generate these images. You curate them yourself - that
+is why they are called "concepts" and not "samples". The quality of your
+training set is bounded by how well these images describe what you want.
+
+See the Directions tab in the Gradio UI for the full pipeline narrative.
+"""
+
+
+DIRECTIONS_MD = """\
+# How Klippbok works
+
+Klippbok turns a pile of raw video into a LoRA training dataset. It's a
+**pipeline** — run each stage in order, review the output, adjust, move on.
+
+Every tab in this UI wraps one Klippbok CLI subcommand. Nothing here is
+magic — you can run the same commands in a terminal and get the same
+results. The UI exists to make the pipeline approachable and to give you
+a visual reviewer for the triage manifest (the part that would otherwise
+mean hand-editing a 1,700-line JSON file in a text editor).
+
+---
+
+## The 60-second mental model
+
+1. You **hand-curate a concepts folder** — small subfolders of reference
+   images, one per thing you want the model to learn (a character, a
+   style, a motion, an object).
+2. **Triage** uses CLIP to score every clip against those references and
+   writes a manifest JSON saying which clip matches which concept.
+3. **Manifest Reviewer** (under construction) lets you visually flip
+   `include: true/false` flags where CLIP got things wrong.
+4. **Ingest** splits long videos into scene-level clips using the reviewed
+   manifest — or skip straight to Normalize if your clips are already cut.
+5. **Caption** writes `.txt` sidecar captions via a vision-language model
+   (Gemini / Replicate / local Ollama).
+6. **Score** and **Audit** spot-check caption quality.
+7. **Validate** checks dataset completeness.
+8. **Organize** lays it out in the format your trainer expects (musubi,
+   aitoolkit, or a flat tree).
+
+---
+
+## What goes in the Concepts folder
+
+This is the one thing you have to do by hand — Klippbok cannot invent it.
+
+```
+concepts/
+  my_character/      ← folder name = concept label
+    ref_01.jpg       ← 5-20 reference images
+    ref_02.jpg
+    ref_03.jpg
+    ...
+  another_character/
+    ...
+  cinematic_style/
+    ...
+```
+
+- **One subfolder per concept.** Short, lowercase name. It becomes the
+  matching label in the triage manifest.
+- **5-20 jpg or png images per concept.** More helps up to a point.
+- **Vary the references** — different poses, lighting, angles. CLIP
+  embeds each image and averages, so diversity protects against
+  over-fitting to one specific frame.
+- **You curate these yourself.** Pull stills from your best clips, find
+  screenshots online, generate references with an image model — whatever
+  represents the thing you want.
+
+If your concepts folder is empty or its subfolders have no images, the
+Triage tab will refuse to launch and point you back here.
+
+---
+
+## What each tab does
+
+| Tab | Klippbok command | When to use it | Needs | Produces |
+|-----|-----------------|----------------|-------|----------|
+| **Directions** | — | You are here. | — | — |
+| **Project** | — | Set shared working/concepts/output paths once per session. | — | Paths for every other tab |
+| **Scan** | `klippbok.video scan` | First thing you run on a new clip dir. Read-only diagnostic. | Clip dir | Text report |
+| **Triage** | `klippbok.video triage` | Match clips to concepts via CLIP. | Clip dir + populated concepts dir | `triage_manifest.json` or `scene_triage_manifest.json` |
+| **Ingest** | `klippbok.video ingest` | Split long videos into scene-level clips (optionally filtered by a triage manifest). | Raw video file/dir | Clip dir in output |
+| **Normalize** | `klippbok.video normalize` | Standardize fps / resolution / frame count on already-cut clips. | Clip dir | Clip dir in output |
+| **Caption** | `klippbok.video caption` | Generate .txt captions via VLM (Gemini / Replicate / Ollama). | Clip dir + API key | .txt per clip |
+| **Score** | `klippbok.video score` | Local heuristic quality check on captions. No API calls. | Dir of .txt | Report |
+| **Extract** | `klippbok.video extract` | Export PNG reference frames. | Clip dir | PNG dir |
+| **Audit** | `klippbok.video audit` | Re-caption with VLM, compare to existing. Catch drift. | Clip dir + API key | Report |
+| **Validate** | `klippbok.dataset validate` | Dataset-level completeness + quality checks. | Dataset dir | Report |
+| **Organize** | `klippbok.dataset organize` | Restructure for trainer (musubi / aitoolkit / flat). | Dataset dir | Trainer-ready dir |
+| **Manifest Reviewer** | — (UI-only) | Visually fix include flags in a triage manifest. | A manifest JSON | `*_reviewed.json` |
+| **Settings** | — | API keys for Gemini / Replicate. | — | In-memory env for Caption/Audit/Ingest |
+
+---
+
+## Two common recipes
+
+### A) Full pipeline — raw footage → trainable dataset
+
+1. **Project tab** → Scaffold a new project layout (or browse to existing folders).
+2. Open the **concepts/** folder (filesystem) and populate it: one subfolder per concept, 5-20 reference images each.
+3. **Triage tab** → run against your raw clips. Produces a manifest.
+4. **Manifest Reviewer tab** → fix any misclassifications CLIP made. Save a reviewed manifest.
+5. **Ingest tab** → point at your raw video (file or directory) with `--triage <reviewed manifest>`. Klippbok scene-splits and writes clips into output/.
+6. **Caption tab** → set --provider, --use-case, --anchor-word. Needs a Gemini or Replicate key in Settings.
+7. **Validate tab** → with --buckets and --quality.
+8. **Organize tab** → with --trainer = musubi or aitoolkit (or both, repeatable).
+
+### B) Re-caption an existing dataset
+
+1. **Project tab** → point Working directory at your existing clip dir.
+2. **Settings tab** → paste API key.
+3. **Caption tab** → check --overwrite.
+4. **Score tab** → sanity-check.
+5. **Audit tab** → compare before/after.
+
+---
+
+## The Settings tab and API keys
+
+- **Gemini** (`GEMINI_API_KEY`): recommended, free tier available, best caption quality. Get a key at https://aistudio.google.com/apikey.
+- **Replicate** (`REPLICATE_API_TOKEN`): pay-per-use. Useful as a fallback.
+- **Ollama / OpenAI-compatible**: pick provider `openai` on Caption, then set `--base-url http://localhost:11434/v1` and `--model llama3.2-vision` in the advanced accordion. No API key needed.
+
+Keys live only in memory by default. Nothing is written to disk unless
+you explicitly save (coming in the next polish step).
+
+---
+
+## When something breaks
+
+- **"Directory not found"** — the path you typed doesn't resolve. Double-check for typos, use forward slashes, or hit Browse.
+- **"ImportError" in Triage** — CLIP's transformers download may have been interrupted. Re-run; it's cached after first success.
+- **Caption "auth error"** — API key not set in Settings, or the wrong provider selected.
+- **Long runs appear frozen** — check the log pane. Klippbok streams progress. If you see nothing for a minute, the process may actually be stuck — use Cancel.
+- **UTF-8 errors on Windows** — already handled via PYTHONUTF8=1 in the subprocess env. If you still see one, it's a bug; please file it.
+
+If anything's unclear, the exact CLI help for every subcommand is in
+`docs/cli_help.txt` at the repo root — regenerated on every install.
+"""
+
+
+# ----- filesystem helpers --------------------------------------------------
+
+
+_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff"}
+
+
+def _scaffold_project(parent: str, name: str) -> tuple[str, str, str, str]:
+    """Create `<parent>/<name>/{clips,concepts,output}` + a concepts README.
+
+    Returns `(message, clips_path, concepts_path, output_path)`. Paths are
+    empty strings on error. The operation is idempotent — running it twice
+    on the same project name won't clobber anything.
+    """
+    if not parent or not name:
+        return ("[error] Fill both Parent directory and Project name.", "", "", "")
+    name = name.strip()
+    if any(c in name for c in '/\\:*?"<>|'):
+        return ("[error] Project name contains illegal characters.", "", "", "")
+
+    base = Path(parent) / name
+    try:
+        clips = base / "clips"
+        concepts = base / "concepts"
+        output = base / "output"
+        for p in (clips, concepts, output):
+            p.mkdir(parents=True, exist_ok=True)
+        readme = concepts / "README.txt"
+        if not readme.exists():
+            readme.write_text(CONCEPTS_README, encoding="utf-8")
+    except Exception as exc:
+        return (f"[error] Could not create folders: {exc}", "", "", "")
+
+    lines = [
+        f"Created {base}",
+        f"  clips/     - put raw videos here (or leave empty if already elsewhere)",
+        f"  concepts/  - add reference image subfolders (see README inside)",
+        f"  output/    - Klippbok writes processed clips + manifests here",
+        "",
+        "Open the concepts folder now and create subfolders for each concept.",
+        "See the Directions tab for what to put inside.",
+    ]
+    return ("\n".join(lines), str(clips), str(concepts), str(output))
+
+
+def _check_concepts_dir(path: str) -> str | None:
+    """Return an error string if the concepts dir isn't usable for Triage, else None."""
+    if not path:
+        return "Concepts folder is required. Set one in the Project tab."
+    p = Path(path)
+    if not p.exists():
+        return f"Concepts folder does not exist: {path}"
+    if not p.is_dir():
+        return f"Concepts path is not a directory: {path}"
+    # CLAUDE-NOTE: Klippbok's triage expects subfolders under concepts/, one
+    # per concept. Dotfiles and underscore-prefixed entries are ignored by
+    # common conventions — filter them so a README.txt next to real concept
+    # folders doesn't make this check pass unintentionally.
+    subdirs = [d for d in p.iterdir() if d.is_dir() and not d.name.startswith((".", "_"))]
+    if not subdirs:
+        return (
+            f"Concepts folder has no concept subfolders. "
+            f"Create subfolders inside `{path}` — one per concept "
+            f"(character / style / motion / object) — and put 5-20 reference "
+            f"images (jpg/png) in each. See the Directions tab for details."
+        )
+    for d in subdirs:
+        try:
+            if any(f.suffix.lower() in _IMAGE_EXTS for f in d.iterdir() if f.is_file()):
+                return None
+        except OSError:
+            continue
+    return (
+        f"Concepts folder has subfolders but no reference images in them. "
+        f"Add 5-20 jpg/png reference images to each concept subfolder. "
+        f"See the Directions tab."
+    )
 
 
 # ----- shared helpers ------------------------------------------------------
@@ -103,6 +355,77 @@ def _dry_preview(cmd: list[str]) -> str:
     return "$ " + runner.format_command(cmd) + "\n[dry run — not executed]"
 
 
+# ----- Directions + Project tabs -----------------------------------------
+
+
+def _tab_directions() -> None:
+    with gr.Tab("Directions"):
+        gr.Markdown(DIRECTIONS_MD)
+
+
+def _tab_project() -> tuple[gr.Textbox, gr.Textbox, gr.Textbox]:
+    """Project tab with the three shared directory rows + a scaffold helper."""
+    with gr.Tab("Project"):
+        gr.Markdown(
+            "### Working directories\n"
+            "Set these once — every command tab starts with the matching path"
+            " as its default, and you can override per-tab as needed.\n\n"
+            "**Concepts is something you populate by hand** — see the"
+            " **Directions** tab if you're not sure what that means."
+        )
+        work_dir = _folder_row(
+            "Working directory",
+            "Your raw video clips, or a dir of pre-split clips.",
+        )
+        concepts_dir = _folder_row(
+            "Concepts directory",
+            "Reference image subfolders — populated by YOU. See Directions tab.",
+        )
+        output_dir = _folder_row(
+            "Output directory",
+            "Where Klippbok writes processed clips + manifests.",
+        )
+
+        with gr.Accordion("Scaffold a new project layout", open=False):
+            gr.Markdown(
+                "Don't have the folder structure yet? Pick a parent location and"
+                " a project name. Klippbok will create `clips/`, `concepts/`, and"
+                " `output/` underneath, drop a README inside `concepts/`"
+                " explaining what to put there, and auto-fill the three path"
+                " boxes above."
+            )
+            with gr.Row():
+                parent = gr.Textbox(label="Parent directory", scale=4)
+                parent_browse = gr.Button("Browse…", scale=0, size="sm", min_width=0)
+                parent_browse.click(_pick_folder, outputs=parent)
+            name = gr.Textbox(
+                label="Project name",
+                value="MyKlippbokProject",
+                info="Subfolder created under the parent directory. Use plain characters.",
+            )
+            scaffold_btn = gr.Button("Create project folders", variant="primary")
+            scaffold_log = gr.Code(label="Result", language=None, value="", interactive=False, visible=False)
+
+            def _do_scaffold(parent_v, name_v):
+                msg, clips, concepts, output = _scaffold_project(parent_v, name_v)
+                # CLAUDE-NOTE: gr.update() (no args) means "don't change this
+                # output" — on error we leave the three path textboxes alone.
+                return (
+                    gr.update(value=msg, visible=True),
+                    clips if clips else gr.update(),
+                    concepts if concepts else gr.update(),
+                    output if output else gr.update(),
+                )
+
+            scaffold_btn.click(
+                _do_scaffold,
+                inputs=[parent, name],
+                outputs=[scaffold_log, work_dir, concepts_dir, output_dir],
+            )
+
+    return work_dir, concepts_dir, output_dir
+
+
 # ----- per-command tab builders -------------------------------------------
 
 
@@ -172,8 +495,9 @@ def _tab_triage(work_dir, concepts_dir, _output, _api) -> None:
             if not directory:
                 yield "[error] Directory is required."
                 return
-            if not concepts:
-                yield "[error] --concepts is required for triage."
+            err = _check_concepts_dir(concepts)
+            if err:
+                yield f"[error] {err}"
                 return
             cmd = _base_cmd("klippbok.video", "triage", directory, "--concepts", concepts)
             if threshold is not None:
@@ -603,14 +927,13 @@ def _tab_organize(work_dir, _concepts, output_dir, _api) -> None:
         )
 
 
-def _tab_settings() -> gr.State:
+def _tab_settings(api_state: gr.State) -> None:
     """Minimal Settings tab — just API keys for now.
 
-    Returns a gr.State holding {"GEMINI_API_KEY": str, "REPLICATE_API_TOKEN": str}.
-    Step 7 will flesh this out with env persistence, python-exe override,
-    and install-check tooling.
+    Writes into the api_state gr.State provided by build_ui so command tabs
+    can read the keys during their handlers. Step 7 will add env persistence,
+    python-exe override, and install-check tooling.
     """
-    api_state = gr.State({})
     with gr.Tab("Settings"):
         gr.Markdown(
             "### Settings\n"
@@ -642,8 +965,6 @@ def _tab_settings() -> gr.State:
         gemini.change(_update_keys, inputs=[gemini, replicate], outputs=api_state)
         replicate.change(_update_keys, inputs=[gemini, replicate], outputs=api_state)
 
-    return api_state
-
 
 # ----- ui ------------------------------------------------------------------
 
@@ -652,24 +973,19 @@ def build_ui() -> gr.Blocks:
     with gr.Blocks(title="Klippbok", analytics_enabled=False) as demo:
         gr.Markdown("# Klippbok\n_Video dataset curation — Pinokio launcher_")
 
-        # Project tab — shared state for every downstream tab.
-        with gr.Tab("Project"):
-            gr.Markdown(
-                "### Working directories\n"
-                "Set these once — every command tab starts with the matching path"
-                " as its default. Override per-tab as needed."
-            )
-            work_dir = _folder_row("Working directory", "Where your raw video clips live.")
-            concepts_dir = _folder_row("Concepts directory", "Reference images for triage (subfolders per concept).")
-            output_dir = _folder_row("Output directory", "Where Klippbok writes processed clips + manifests.")
+        # CLAUDE-NOTE: api_state is declared up front so the command tabs
+        # (built in display order below) can reference it as an input while
+        # the Settings tab (built last, to appear last in the tab strip)
+        # writes into it via .change() handlers.
+        api_state = gr.State({})
 
-        # Settings built early so API key state is available to caption/audit/ingest tabs.
-        # CLAUDE-NOTE: Tab display order is insertion order, so Settings is
-        # visually last — we render the other tabs first but keep a forward
-        # reference to the api state. Simplest way: build Settings first, keep
-        # its state, then build the rest. Gradio will order them by code order.
-        api_state = _tab_settings()
+        # Landing / orientation.
+        _tab_directions()
 
+        # Shared directory state + scaffold helper.
+        work_dir, concepts_dir, output_dir = _tab_project()
+
+        # The Klippbok command tabs, in pipeline order.
         for builder in (
             _tab_scan,
             _tab_triage,
@@ -684,7 +1000,7 @@ def build_ui() -> gr.Blocks:
         ):
             builder(work_dir, concepts_dir, output_dir, api_state)
 
-        # Manifest Reviewer placeholder (step 6).
+        # Manifest Reviewer — ships in step 6.
         with gr.Tab("Manifest Reviewer"):
             gr.Markdown(
                 "_**Manifest Reviewer** — under construction. "
@@ -692,6 +1008,9 @@ def build_ui() -> gr.Blocks:
                 "render thumbnails per entry, and let you toggle `include` flags in bulk. "
                 "Arriving in the next checkpoint._"
             )
+
+        # API keys, install-check, python-exe override (polished in step 7).
+        _tab_settings(api_state)
 
     return demo
 
