@@ -102,7 +102,7 @@ mean hand-editing a 1,700-line JSON file in a text editor).
    style, a motion, an object).
 2. **Triage** uses CLIP to score every clip against those references and
    writes a manifest JSON saying which clip matches which concept.
-3. **Manifest Reviewer** (under construction) lets you visually flip
+3. **Manifest Reviewer** lets you visually flip
    `include: true/false` flags where CLIP got things wrong.
 4. **Ingest** splits long videos into scene-level clips using the reviewed
    manifest — or skip straight to Normalize if your clips are already cut.
