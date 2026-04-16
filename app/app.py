@@ -1,16 +1,26 @@
 """Klippbok Pinokio launcher — Gradio UI.
 
-# TODO (build plan — ~/.claude/plans/clever-sleeping-emerson.md):
-#   [x] Step 2 — Pinokio skeleton + hello-world Gradio
-#   [x] Step 3 — klippbok[all] + torch.js + help dump
-#   [x] Step 4 — Project tab + Scan tab
-#   [x] Step 5 — all command tabs + minimal Settings
-#   [>] Step 6 — Manifest Reviewer (this checkpoint)
-#   [ ] Step 7 — Settings polish + README walkthrough
+Build plan complete (see ~/.claude/plans/clever-sleeping-emerson.md):
+
+    Step 2 - Pinokio skeleton + hello-world Gradio
+    Step 3 - klippbok[all] + torch.js + help dump
+    Step 4 - Project tab + Scan tab + streaming-log pattern
+    Step 5 - Triage/Ingest/Normalize/Caption/Score/Extract/Audit/
+             Validate/Organize tabs + minimal Settings for API keys
+    Step 6 - Manifest Reviewer (both schemas, thumbnails, pagination,
+             bulk actions, auto-link from Triage output)
+    Step 7 - Settings polish (.env persist + hydrate on start +
+             install check), full README, ELI5 beginner walkthrough
+             in Directions tab
+
+Further work, when needed: Python-exe override, per-clip Notes
+field in the Reviewer, concept subfolder quick-add in the Project tab.
 """
 from __future__ import annotations
 
 import argparse
+import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Iterator
@@ -207,24 +217,24 @@ but out of the dataset.
 
 ## Two common recipes
 
-### A) Full pipeline — raw footage → trainable dataset
+### A) Full pipeline — raw footage ->trainable dataset
 
-1. **Project tab** → Scaffold a new project layout (or browse to existing folders).
+1. **Project tab** ->Scaffold a new project layout (or browse to existing folders).
 2. Open the **concepts/** folder (filesystem) and populate it: one subfolder per concept, 5-20 reference images each.
-3. **Triage tab** → run against your raw clips. Produces a manifest.
-4. **Manifest Reviewer tab** → fix any misclassifications CLIP made. Save a reviewed manifest.
-5. **Ingest tab** → point at your raw video (file or directory) with `--triage <reviewed manifest>`. Klippbok scene-splits and writes clips into output/.
-6. **Caption tab** → set --provider, --use-case, --anchor-word. Needs a Gemini or Replicate key in Settings.
-7. **Validate tab** → with --buckets and --quality.
-8. **Organize tab** → with --trainer = musubi or aitoolkit (or both, repeatable).
+3. **Triage tab** ->run against your raw clips. Produces a manifest.
+4. **Manifest Reviewer tab** ->fix any misclassifications CLIP made. Save a reviewed manifest.
+5. **Ingest tab** ->point at your raw video (file or directory) with `--triage <reviewed manifest>`. Klippbok scene-splits and writes clips into output/.
+6. **Caption tab** ->set --provider, --use-case, --anchor-word. Needs a Gemini or Replicate key in Settings.
+7. **Validate tab** ->with --buckets and --quality.
+8. **Organize tab** ->with --trainer = musubi or aitoolkit (or both, repeatable).
 
 ### B) Re-caption an existing dataset
 
-1. **Project tab** → point Working directory at your existing clip dir.
-2. **Settings tab** → paste API key.
-3. **Caption tab** → check --overwrite.
-4. **Score tab** → sanity-check.
-5. **Audit tab** → compare before/after.
+1. **Project tab** ->point Working directory at your existing clip dir.
+2. **Settings tab** ->paste API key.
+3. **Caption tab** ->check --overwrite.
+4. **Score tab** ->sanity-check.
+5. **Audit tab** ->compare before/after.
 
 ---
 
@@ -388,7 +398,7 @@ moves.
 #### Step 1 — Make the folders
 
 Same as image LoRA:
-1. **Project** tab → **Scaffold a new project layout** → pick parent,
+1. **Project** tab ->**Scaffold a new project layout** ->pick parent,
    name it, click **Create project folders**.
 2. Three path boxes auto-fill.
 
@@ -469,8 +479,8 @@ This is the payoff. CLIP is smart but wrong sometimes. You fix it.
    - Look at the thumbnail.
    - Does it really show the concept listed (top-right of the
      metadata)?
-   - If yes and it's excluded → tick Include.
-   - If no and it's included → untick Include.
+   - If yes and it's excluded ->tick Include.
+   - If no and it's included ->untick Include.
 6. Click **Save**. You get `<name>_reviewed.json` alongside the
    original. Your raw Triage output stays untouched.
 
@@ -574,6 +584,111 @@ Every command tab streams stdout into the log pane. You care about:
 - **Forgetting to set `--anchor-word`.** Without it, the model has
   no stable token to learn — prompting it later won't work well.
 """
+
+
+# ----- .env + install-check helpers ---------------------------------------
+
+
+_RELEVANT_ENV_KEYS = ("GEMINI_API_KEY", "REPLICATE_API_TOKEN")
+
+
+def _env_path() -> Path:
+    """Location of the .env file — repo root, sibling to pinokio.js."""
+    return Path(__file__).resolve().parent.parent / ".env"
+
+
+def _load_env() -> dict[str, str]:
+    """Parse a simple KEY=VALUE .env file. Returns {} if absent or empty."""
+    path = _env_path()
+    if not path.exists():
+        return {}
+    result: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        # CLAUDE-NOTE: Strip surrounding quotes (single or double). Doesn't
+        # handle escaped quotes inside values — that's fine for API tokens,
+        # which are opaque alphanumeric strings without shell specials.
+        v = v.strip()
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
+            v = v[1:-1]
+        result[k.strip()] = v
+    return result
+
+
+def _save_env(keys: dict[str, str]) -> str:
+    """Write `keys` into .env, preserving any unrelated keys already there.
+
+    Returns the absolute path written to (as a string) for display. Empty
+    values in `keys` are skipped rather than deleting an existing entry —
+    that way clearing a textbox doesn't nuke a key you meant to keep.
+    """
+    path = _env_path()
+    merged = _load_env() if path.exists() else {}
+    for k, v in keys.items():
+        if v:
+            merged[k] = v
+    lines = ["# Klippbok API keys — managed by the Settings tab in the UI."]
+    for k, v in sorted(merged.items()):
+        if v:
+            lines.append(f'{k}="{v}"')
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return str(path)
+
+
+def _check_installation() -> str:
+    """Run the klippbok + ffmpeg + Python version checks and format a report."""
+    lines: list[str] = []
+    try:
+        r = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import klippbok; print(getattr(klippbok, '__version__', '?'))",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if r.returncode == 0:
+            lines.append(f"[ok]klippbok {r.stdout.strip()}")
+        else:
+            stderr_tail = (r.stderr or "").strip().splitlines()[-1:] or ["import failed"]
+            lines.append(f"[!!]klippbok: {stderr_tail[0]}")
+    except Exception as exc:  # noqa: BLE001 — we want every failure surfaced in the UI
+        lines.append(f"[!!]klippbok check failed: {exc}")
+
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-version"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if r.returncode == 0 and r.stdout:
+            first = r.stdout.splitlines()[0]
+            lines.append(f"[ok]{first}")
+        else:
+            lines.append("[!!]ffmpeg on PATH but returned non-zero")
+    except FileNotFoundError:
+        lines.append(
+            "[!!]ffmpeg NOT on PATH — install it "
+            "(https://www.ffmpeg.org/download.html)"
+        )
+    except subprocess.TimeoutExpired:
+        lines.append("[!!]ffmpeg check timed out")
+    except Exception as exc:  # noqa: BLE001
+        lines.append(f"[!!]ffmpeg check failed: {exc}")
+
+    lines.append(f"->Python {sys.version.split()[0]} at {sys.executable}")
+    env_p = _env_path()
+    if env_p.exists():
+        lines.append(f"->.env found: {env_p}")
+    else:
+        lines.append(f"->.env not yet created (would be written to {env_p})")
+    return "\n".join(lines)
 
 
 # ----- filesystem helpers --------------------------------------------------
@@ -1354,42 +1469,63 @@ def _tab_organize(work_dir, _concepts, output_dir, _api) -> None:
 
 
 def _tab_settings(api_state: gr.State) -> None:
-    """Minimal Settings tab — just API keys for now.
-
-    Writes into the api_state gr.State provided by build_ui so command tabs
-    can read the keys during their handlers. Step 7 will add env persistence,
-    python-exe override, and install-check tooling.
-    """
+    """API keys, .env persistence, and install check."""
+    loaded = _load_env()
     with gr.Tab("Settings"):
         gr.Markdown(
             "### Settings\n"
-            "API keys live here and are passed into Caption/Audit/Ingest(`--caption`) subprocesses "
-            "via the environment. They are **not** saved to disk — keep them alive by leaving this "
-            "tab configured for the session. Persistence and an install check land in the final polish step."
+            "API keys are passed into Caption / Audit / Ingest(`--caption`) subprocesses"
+            " via the environment. They live only in memory unless you click"
+            f" **Save to .env**, which writes them to `{_env_path()}` — gitignored."
+            " On next startup the UI auto-loads from .env so you don't have to re-paste."
         )
         gemini = gr.Textbox(
             label="GEMINI_API_KEY",
             type="password",
-            info="Required for `--provider gemini`.",
-            value="",
+            info="Required for `--provider gemini` (free tier: https://aistudio.google.com/apikey).",
+            value=loaded.get("GEMINI_API_KEY", ""),
         )
         replicate = gr.Textbox(
             label="REPLICATE_API_TOKEN",
             type="password",
             info="Required for `--provider replicate`.",
-            value="",
+            value=loaded.get("REPLICATE_API_TOKEN", ""),
         )
 
-        def _update_keys(g, r):
-            keys = {}
+        def _collect(g: str, r: str) -> dict[str, str]:
+            keys: dict[str, str] = {}
             if g:
                 keys["GEMINI_API_KEY"] = g
             if r:
                 keys["REPLICATE_API_TOKEN"] = r
             return keys
 
-        gemini.change(_update_keys, inputs=[gemini, replicate], outputs=api_state)
-        replicate.change(_update_keys, inputs=[gemini, replicate], outputs=api_state)
+        gemini.change(_collect, inputs=[gemini, replicate], outputs=api_state)
+        replicate.change(_collect, inputs=[gemini, replicate], outputs=api_state)
+
+        with gr.Row():
+            save_btn = gr.Button("Save to .env", variant="primary", scale=0)
+            check_btn = gr.Button("Check installation", scale=0)
+        action_log = gr.Textbox(
+            label="Status",
+            lines=6,
+            max_lines=20,
+            interactive=False,
+            show_copy_button=True,
+        )
+
+        def _on_save(g: str, r: str) -> str:
+            keys = _collect(g, r)
+            if not keys:
+                return "Nothing to save — both key fields are empty."
+            try:
+                path = _save_env(keys)
+            except Exception as exc:  # noqa: BLE001
+                return f"[error] Could not write .env: {exc}"
+            return f"Wrote {len(keys)} key(s) to {path}"
+
+        save_btn.click(_on_save, inputs=[gemini, replicate], outputs=action_log)
+        check_btn.click(_check_installation, outputs=action_log)
 
 
 # ----- Manifest Reviewer --------------------------------------------------
@@ -1400,7 +1536,7 @@ def _render_entry_meta(e: mft.Entry) -> str:
     concept = e.best_concept or "_(no match)_"
     lines = [
         f"**{e.display_label}**",
-        f"Score: `{e.score:.3f}` → `{concept}`",
+        f"Score: `{e.score:.3f}` ->`{concept}`",
     ]
     if e.text_overlay:
         lines.append("⚠ text overlay detected")
@@ -1699,8 +1835,13 @@ def build_ui() -> gr.Blocks:
 
         # CLAUDE-NOTE: Shared state declared up front so the command tabs
         # (built in display order below) can reference it as an input while
-        # other tabs write into it via .change() handlers.
-        api_state = gr.State({})
+        # other tabs write into it via .change() handlers. Initial value
+        # is hydrated from .env if present, so Caption/Audit work without
+        # the user having to visit Settings first.
+        _persisted = _load_env()
+        api_state = gr.State(
+            {k: v for k, v in _persisted.items() if k in _RELEVANT_ENV_KEYS and v}
+        )
         # Populated by the Triage tab on successful run; consumed by the
         # Manifest Reviewer to auto-fill its path box.
         last_manifest_state = gr.State("")
