@@ -4,19 +4,32 @@
 #   [x] Step 2 — Pinokio skeleton + hello-world Gradio
 #   [x] Step 3 — klippbok[all] + torch.js + help dump
 #   [x] Step 4 — Project tab + Scan tab
-#   [>] Step 5 — all command tabs + minimal Settings (this checkpoint)
-#   [ ] Step 6 — Manifest Reviewer (both schemas, thumbnails, bulk actions)
+#   [x] Step 5 — all command tabs + minimal Settings
+#   [>] Step 6 — Manifest Reviewer (this checkpoint)
 #   [ ] Step 7 — Settings polish + README walkthrough
 """
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Iterator
 
 import gradio as gr
 
+import manifest as mft
 import runner
+
+
+# Thumbnails live next to the venv, outside `app/`, so they're gitignored and
+# don't bloat the source tree even for 1700-entry manifests.
+_CACHE_DIR = Path(__file__).resolve().parent.parent / "cache" / "thumbs"
+
+# CLAUDE-NOTE: PAGE_SIZE pre-renders this many Gradio rows. On page turn we
+# update their values in a single batch. 25 is a compromise: small enough
+# that parallel thumbnail extraction completes in a couple of seconds, big
+# enough that reviewers can scan quickly without constant paging.
+_PAGE_SIZE = 25
 
 
 # ----- long-form constants (markdown blocks, readme text) ------------------
@@ -966,6 +979,270 @@ def _tab_settings(api_state: gr.State) -> None:
         replicate.change(_update_keys, inputs=[gemini, replicate], outputs=api_state)
 
 
+# ----- Manifest Reviewer --------------------------------------------------
+
+
+def _render_entry_meta(e: mft.Entry) -> str:
+    """Markdown block shown next to each thumbnail."""
+    concept = e.best_concept or "_(no match)_"
+    lines = [
+        f"**{e.display_label}**",
+        f"Score: `{e.score:.3f}` → `{concept}`",
+    ]
+    if e.text_overlay:
+        lines.append("⚠ text overlay detected")
+    if e.use_case:
+        lines.append(f"Use case: `{e.use_case}`")
+    lines.append(f"Path: `{e.video_path}`")
+    return "  \n".join(lines)
+
+
+def _summary(state: dict) -> str:
+    entries = state.get("entries") or []
+    if not entries:
+        return "_No manifest loaded._"
+    included = sum(1 for e in entries if e.include)
+    kind = state.get("kind", "?")
+    path = state.get("path", "")
+    return f"**{included} of {len(entries)} included** · kind=`{kind}` · source `{path}`"
+
+
+def _page_label(state: dict) -> str:
+    entries = state.get("entries") or []
+    if not entries:
+        return "—"
+    page = state.get("page", 0)
+    total = max(1, (len(entries) + _PAGE_SIZE - 1) // _PAGE_SIZE)
+    return f"Page **{page + 1}** of **{total}**"
+
+
+def _render_page(state: dict) -> list:
+    """Return a flat list of updates: [status, page_label, *25×(row, image, md, checkbox)]."""
+    out: list = [gr.update(value=_summary(state)), gr.update(value=_page_label(state))]
+    entries = state.get("entries") or []
+    page = state.get("page", 0)
+    page_entries = entries[page * _PAGE_SIZE : (page + 1) * _PAGE_SIZE]
+
+    # Parallelize thumbnail extraction — ffmpeg runs are I/O-bound and cached
+    # after the first visit, so subsequent page turns are fast.
+    thumbs: list = [None] * len(page_entries)
+    if page_entries:
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            for i, path in enumerate(ex.map(lambda e: mft.generate_thumbnail(e, _CACHE_DIR), page_entries)):
+                thumbs[i] = path
+
+    for i in range(_PAGE_SIZE):
+        if i < len(page_entries):
+            e = page_entries[i]
+            out += [
+                gr.update(visible=True),
+                gr.update(value=thumbs[i]),
+                gr.update(value=_render_entry_meta(e)),
+                gr.update(value=bool(e.include)),
+            ]
+        else:
+            out += [
+                gr.update(visible=False),
+                gr.update(value=None),
+                gr.update(value=""),
+                gr.update(value=True),
+            ]
+    return out
+
+
+def _tab_manifest_reviewer() -> None:
+    with gr.Tab("Manifest Reviewer"):
+        gr.Markdown(
+            "### Manifest Reviewer\n"
+            "Load a `triage_manifest.json` (clip-level) or `scene_triage_manifest.json` "
+            "(scene-level). Thumbnails are extracted on demand via ffmpeg and cached in "
+            "`cache/thumbs/`. Toggle `Include` per row, or use bulk actions below. Save "
+            "writes to `<name>_reviewed.json` by default so your original is untouched."
+        )
+
+        # CLAUDE-NOTE: state dict shape = {path, raw, entries, kind, page}.
+        # entries is a list[mft.Entry]. raw is the pristine manifest dict —
+        # save_manifest writes `include` back into it without touching any
+        # other field, so Klippbok's round-trips stay lossless.
+        state = gr.State({})
+
+        # ---- Load row --------------------------------------------------
+        with gr.Row():
+            path_in = gr.Textbox(
+                label="Manifest path",
+                placeholder="…/triage_manifest.json or …/scene_triage_manifest.json",
+                scale=4,
+            )
+            path_browse = gr.Button("Browse…", scale=0, size="sm", min_width=0)
+            load_btn = gr.Button("Load", variant="primary", scale=0)
+
+        def _pick_manifest_path() -> str:
+            try:
+                import tkinter as tk
+                from tkinter import filedialog
+
+                root = tk.Tk()
+                root.withdraw()
+                root.attributes("-topmost", True)
+                p = filedialog.askopenfilename(
+                    title="Select triage manifest",
+                    filetypes=[("JSON", "*.json"), ("All", "*.*")],
+                )
+                root.destroy()
+                return p or ""
+            except Exception:
+                return ""
+
+        path_browse.click(_pick_manifest_path, outputs=path_in)
+
+        status = gr.Markdown(_summary({}))
+
+        # ---- Bulk actions ---------------------------------------------
+        with gr.Row():
+            include_all = gr.Button("Include all")
+            exclude_all = gr.Button("Exclude all")
+            threshold = gr.Slider(0.0, 1.0, value=0.70, step=0.01, label="Threshold")
+            apply_thr = gr.Button("Include where score ≥ threshold")
+            exclude_overlays = gr.Button("Exclude clips with text overlay")
+
+        # ---- Pagination -----------------------------------------------
+        with gr.Row():
+            prev_btn = gr.Button("◀ Prev", scale=0)
+            page_label = gr.Markdown("—")
+            next_btn = gr.Button("Next ▶", scale=0)
+
+        # ---- 25 fixed slots --------------------------------------------
+        rows: list = []
+        thumbs: list = []
+        metas: list = []
+        checks: list = []
+        for i in range(_PAGE_SIZE):
+            with gr.Row(visible=False, equal_height=True) as row:
+                thumb = gr.Image(
+                    show_label=False,
+                    interactive=False,
+                    show_download_button=False,
+                    height=120,
+                    width=200,
+                    container=False,
+                )
+                meta = gr.Markdown()
+                check = gr.Checkbox(label="Include", value=True, scale=0, min_width=120)
+            rows.append(row)
+            thumbs.append(thumb)
+            metas.append(meta)
+            checks.append(check)
+
+        # ---- Save ------------------------------------------------------
+        with gr.Row():
+            overwrite = gr.Checkbox(label="Overwrite original (otherwise write *_reviewed.json)", value=False)
+            save_btn = gr.Button("Save", variant="primary")
+        save_log = gr.Markdown("")
+
+        # ---- Outputs list reused by handlers that re-render the page ---
+        page_outputs = [status, page_label]
+        for i in range(_PAGE_SIZE):
+            page_outputs += [rows[i], thumbs[i], metas[i], checks[i]]
+
+        # ---- Handlers --------------------------------------------------
+        def _on_load(p: str):
+            if not p:
+                blank = {}
+                return [blank, *_render_page(blank)]
+            try:
+                raw, entries, kind = mft.load_manifest(p)
+            except Exception as exc:
+                # Reuse blank state so the page clears; surface the error in status.
+                err_state = {}
+                updates = _render_page(err_state)
+                updates[0] = gr.update(value=f"**[error]** {exc}")
+                return [err_state, *updates]
+            new_state = {"path": str(p), "raw": raw, "entries": entries, "kind": kind, "page": 0}
+            return [new_state, *_render_page(new_state)]
+
+        load_btn.click(
+            _on_load,
+            inputs=[path_in],
+            outputs=[state, *page_outputs],
+        )
+
+        def _on_prev(st: dict):
+            st = dict(st) if st else {}
+            st["page"] = max(0, st.get("page", 0) - 1)
+            return [st, *_render_page(st)]
+
+        def _on_next(st: dict):
+            st = dict(st) if st else {}
+            entries = st.get("entries") or []
+            total = max(1, (len(entries) + _PAGE_SIZE - 1) // _PAGE_SIZE)
+            st["page"] = min(total - 1, st.get("page", 0) + 1)
+            return [st, *_render_page(st)]
+
+        prev_btn.click(_on_prev, inputs=[state], outputs=[state, *page_outputs])
+        next_btn.click(_on_next, inputs=[state], outputs=[state, *page_outputs])
+
+        def _set_all(st: dict, value: bool):
+            if not st or not st.get("entries"):
+                return [st, *_render_page(st or {})]
+            for e in st["entries"]:
+                e.include = value
+            return [st, *_render_page(st)]
+
+        include_all.click(lambda st: _set_all(st, True), inputs=[state], outputs=[state, *page_outputs])
+        exclude_all.click(lambda st: _set_all(st, False), inputs=[state], outputs=[state, *page_outputs])
+
+        def _on_apply_threshold(st: dict, thr: float):
+            if not st or not st.get("entries"):
+                return [st, *_render_page(st or {})]
+            for e in st["entries"]:
+                e.include = e.score >= float(thr)
+            return [st, *_render_page(st)]
+
+        apply_thr.click(
+            _on_apply_threshold,
+            inputs=[state, threshold],
+            outputs=[state, *page_outputs],
+        )
+
+        def _on_exclude_overlays(st: dict):
+            if not st or not st.get("entries"):
+                return [st, *_render_page(st or {})]
+            for e in st["entries"]:
+                if e.text_overlay:
+                    e.include = False
+            return [st, *_render_page(st)]
+
+        exclude_overlays.click(_on_exclude_overlays, inputs=[state], outputs=[state, *page_outputs])
+
+        # Per-slot checkbox — updates the underlying entry's include flag and
+        # the summary, but does NOT re-render other slots. Uses .input (fires
+        # only on user interaction) to avoid feedback loops when bulk actions
+        # set checkbox values programmatically.
+        for i, check in enumerate(checks):
+            def _on_toggle(new_value: bool, st: dict, slot_idx: int = i):
+                entries = (st or {}).get("entries") or []
+                page = (st or {}).get("page", 0)
+                global_idx = page * _PAGE_SIZE + slot_idx
+                if 0 <= global_idx < len(entries):
+                    entries[global_idx].include = bool(new_value)
+                return st, gr.update(value=_summary(st))
+            check.input(_on_toggle, inputs=[check, state], outputs=[state, status])
+
+        def _on_save(st: dict, overwrite_original: bool):
+            if not st or not st.get("entries"):
+                return "_Load a manifest first._"
+            src = Path(st["path"])
+            dest = src if overwrite_original else mft.reviewed_path_for(src)
+            try:
+                mft.save_manifest(st["raw"], st["entries"], dest)
+            except Exception as exc:
+                return f"**[error]** {exc}"
+            included = sum(1 for e in st["entries"] if e.include)
+            return f"Saved {included} / {len(st['entries'])} to `{dest}`"
+
+        save_btn.click(_on_save, inputs=[state, overwrite], outputs=save_log)
+
+
 # ----- ui ------------------------------------------------------------------
 
 
@@ -1000,14 +1277,8 @@ def build_ui() -> gr.Blocks:
         ):
             builder(work_dir, concepts_dir, output_dir, api_state)
 
-        # Manifest Reviewer — ships in step 6.
-        with gr.Tab("Manifest Reviewer"):
-            gr.Markdown(
-                "_**Manifest Reviewer** — under construction. "
-                "Will load `triage_manifest.json` or `scene_triage_manifest.json`, "
-                "render thumbnails per entry, and let you toggle `include` flags in bulk. "
-                "Arriving in the next checkpoint._"
-            )
+        # Manifest Reviewer — the whole reason this launcher exists.
+        _tab_manifest_reviewer()
 
         # API keys, install-check, python-exe override (polished in step 7).
         _tab_settings(api_state)
