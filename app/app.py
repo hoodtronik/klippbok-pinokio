@@ -158,6 +158,53 @@ Triage tab will refuse to launch and point you back here.
 
 ---
 
+## Reviewing the triage manifest
+
+Triage writes a JSON manifest marking every clip (or scene) with an
+`include: true/false` flag based on CLIP similarity. That's the one
+place the pipeline expects human judgment — CLIP gets confused on
+edge cases, you know your dataset.
+
+**1. Triage writes the manifest.** Default destination:
+- `<clips_dir>/triage_manifest.json` for clip-level runs (when your
+  source is already short clips).
+- `<clips_dir>/scene_triage_manifest.json` for scene-level runs
+  (long source videos Klippbok auto-scene-detected).
+
+If you passed `--output /some/path.json` to Triage, it goes there
+instead. Either way, the **Manifest Reviewer's** path box
+auto-populates with the latest Triage output as soon as Triage
+finishes. If you restart the UI, click **Use latest triage output**
+and it'll scan your working directory for a matching file.
+
+**2. First page load extracts thumbnails.** The Reviewer shells out to
+ffmpeg (8 jobs in parallel) to grab a frame from the midpoint of each
+clip/scene. Expect a few seconds on the first page of each manifest;
+subsequent visits are instant thanks to `cache/thumbs/`.
+
+**3. Triage in bulk first, clean up by hand second.** In this order:
+- **Threshold slider + "Include where score ≥ threshold"** — gate by
+  CLIP confidence. Klippbok's default cutoff is 0.70; raise it for
+  more precision (fewer false positives), lower it for more recall
+  (fewer missed matches).
+- **"Exclude clips with text overlay"** — drops every entry Klippbok
+  flagged as having burnt-in text (watermarks, subtitles, UI
+  captures). Training on those usually hurts more than it helps.
+- **Per-row Include checkboxes** for the ones CLIP got wrong.
+  Each row shows a thumbnail + the best-match concept + its
+  similarity score — enough context to decide in a glance.
+
+**4. Save.** Writes to `<name>_reviewed.json` alongside the original
+by default so your raw Triage output stays untouched. Check
+**"Overwrite original"** if you'd rather edit in place.
+
+**5. Feed the reviewed manifest into Ingest.** Paste the reviewed
+path into the **Ingest** tab's `--triage` field. Ingest will only
+scene-split clips/scenes you kept, leaving everything else on disk
+but out of the dataset.
+
+---
+
 ## Two common recipes
 
 ### A) Full pipeline — raw footage → trainable dataset
@@ -247,6 +294,36 @@ def _scaffold_project(parent: str, name: str) -> tuple[str, str, str, str]:
         "See the Directions tab for what to put inside.",
     ]
     return ("\n".join(lines), str(clips), str(concepts), str(output))
+
+
+def _detect_triage_manifest(directory: str, output_override: str) -> str:
+    """Best-effort detection of the JSON file Triage just wrote.
+
+    Returns the absolute path as a string, or "" if nothing was found.
+    Checked in priority order:
+      1. An explicit --output path (if the user set one and it exists).
+      2. `<directory>/scene_triage_manifest.json` (long-video mode).
+      3. `<directory>/triage_manifest.json` (clip-level mode).
+    If both scene and clip files exist, picks whichever is newer — that's the
+    one Triage just wrote. The Reviewer tab reads this to auto-populate.
+    """
+    if output_override:
+        p = Path(output_override)
+        if p.exists() and p.is_file():
+            return str(p)
+    if not directory:
+        return ""
+    dir_p = Path(directory)
+    if not dir_p.is_dir():
+        return ""
+    candidates = [
+        dir_p / "scene_triage_manifest.json",
+        dir_p / "triage_manifest.json",
+    ]
+    existing = [c for c in candidates if c.exists() and c.is_file()]
+    if not existing:
+        return ""
+    return str(max(existing, key=lambda p: p.stat().st_mtime))
 
 
 def _check_concepts_dir(path: str) -> str | None:
@@ -477,7 +554,7 @@ def _tab_scan(work_dir, _concepts, _output, _api) -> None:
         s["run_btn"].click(_run, inputs=[s["directory"], config, fps, verbose, s["dry_run"]], outputs=s["log"])
 
 
-def _tab_triage(work_dir, concepts_dir, _output, _api) -> None:
+def _tab_triage(work_dir, concepts_dir, _output, _api, last_manifest_state: gr.State) -> None:
     tab_id = "triage"
     with gr.Tab("Triage"):
         s = _command_shell(
@@ -534,10 +611,22 @@ def _tab_triage(work_dir, concepts_dir, _output, _api) -> None:
                 return
             yield from _stream(tab_id, cmd)
 
+        def _after_run(directory: str, output_override: str, dry: bool, current: str) -> str:
+            # CLAUDE-NOTE: Don't update state on dry runs — Klippbok wasn't
+            # actually invoked so nothing was written. Keep whatever was there.
+            if dry:
+                return current
+            detected = _detect_triage_manifest(directory, output_override)
+            return detected or current
+
         s["run_btn"].click(
             _run,
             inputs=[s["directory"], concepts, threshold, frames, frames_per_scene, scene_threshold, output, organize, move, clip_model, s["dry_run"]],
             outputs=s["log"],
+        ).then(
+            _after_run,
+            inputs=[s["directory"], output, s["dry_run"], last_manifest_state],
+            outputs=last_manifest_state,
         )
 
 
@@ -1050,14 +1139,16 @@ def _render_page(state: dict) -> list:
     return out
 
 
-def _tab_manifest_reviewer() -> None:
+def _tab_manifest_reviewer(last_manifest_state: gr.State, work_dir: gr.Textbox) -> None:
     with gr.Tab("Manifest Reviewer"):
         gr.Markdown(
             "### Manifest Reviewer\n"
             "Load a `triage_manifest.json` (clip-level) or `scene_triage_manifest.json` "
-            "(scene-level). Thumbnails are extracted on demand via ffmpeg and cached in "
-            "`cache/thumbs/`. Toggle `Include` per row, or use bulk actions below. Save "
-            "writes to `<name>_reviewed.json` by default so your original is untouched."
+            "(scene-level). The path auto-populates as soon as Triage finishes; click "
+            "**Use latest triage output** if you restarted the UI and want to pick up the "
+            "last run from disk. Thumbnails are extracted on demand via ffmpeg and cached "
+            "in `cache/thumbs/`. Save writes to `<name>_reviewed.json` by default so your "
+            "original stays untouched."
         )
 
         # CLAUDE-NOTE: state dict shape = {path, raw, entries, kind, page}.
@@ -1074,7 +1165,39 @@ def _tab_manifest_reviewer() -> None:
                 scale=4,
             )
             path_browse = gr.Button("Browse…", scale=0, size="sm", min_width=0)
+            use_latest_btn = gr.Button("Use latest triage output", scale=0, size="sm")
             load_btn = gr.Button("Load", variant="primary", scale=0)
+
+        # CLAUDE-NOTE: When Triage finishes it pushes the written manifest path
+        # into last_manifest_state. Auto-fill path_in only if the user hasn't
+        # typed anything — don't clobber their in-progress work.
+        def _on_triage_output(latest: str, current: str) -> str:
+            if current:
+                return current
+            return latest or ""
+        last_manifest_state.change(
+            _on_triage_output, inputs=[last_manifest_state, path_in], outputs=path_in
+        )
+
+        # Explicit button for the "I restarted the UI, find the latest from disk"
+        # case, which scans the Project tab's working directory too.
+        def _use_latest(latest: str, wd: str, current: str) -> str:
+            candidate = latest
+            if not candidate and wd:
+                candidate = _detect_triage_manifest(wd, "")
+            if not candidate:
+                gr.Warning(
+                    "No triage manifest found. Run Triage first, set Working "
+                    "directory in the Project tab, or Browse to a manifest manually."
+                )
+                return current
+            gr.Info(f"Loaded path: {candidate}")
+            return candidate
+        use_latest_btn.click(
+            _use_latest,
+            inputs=[last_manifest_state, work_dir, path_in],
+            outputs=path_in,
+        )
 
         def _pick_manifest_path() -> str:
             try:
@@ -1250,11 +1373,13 @@ def build_ui() -> gr.Blocks:
     with gr.Blocks(title="Klippbok", analytics_enabled=False) as demo:
         gr.Markdown("# Klippbok\n_Video dataset curation — Pinokio launcher_")
 
-        # CLAUDE-NOTE: api_state is declared up front so the command tabs
+        # CLAUDE-NOTE: Shared state declared up front so the command tabs
         # (built in display order below) can reference it as an input while
-        # the Settings tab (built last, to appear last in the tab strip)
-        # writes into it via .change() handlers.
+        # other tabs write into it via .change() handlers.
         api_state = gr.State({})
+        # Populated by the Triage tab on successful run; consumed by the
+        # Manifest Reviewer to auto-fill its path box.
+        last_manifest_state = gr.State("")
 
         # Landing / orientation.
         _tab_directions()
@@ -1262,23 +1387,22 @@ def build_ui() -> gr.Blocks:
         # Shared directory state + scaffold helper.
         work_dir, concepts_dir, output_dir = _tab_project()
 
-        # The Klippbok command tabs, in pipeline order.
-        for builder in (
-            _tab_scan,
-            _tab_triage,
-            _tab_ingest,
-            _tab_normalize,
-            _tab_caption,
-            _tab_score,
-            _tab_extract,
-            _tab_audit,
-            _tab_validate,
-            _tab_organize,
-        ):
-            builder(work_dir, concepts_dir, output_dir, api_state)
+        # The Klippbok command tabs, in pipeline order. Triage and the
+        # Reviewer are the only tabs that need last_manifest_state, so the
+        # others stay on the uniform four-arg signature.
+        _tab_scan(work_dir, concepts_dir, output_dir, api_state)
+        _tab_triage(work_dir, concepts_dir, output_dir, api_state, last_manifest_state)
+        _tab_ingest(work_dir, concepts_dir, output_dir, api_state)
+        _tab_normalize(work_dir, concepts_dir, output_dir, api_state)
+        _tab_caption(work_dir, concepts_dir, output_dir, api_state)
+        _tab_score(work_dir, concepts_dir, output_dir, api_state)
+        _tab_extract(work_dir, concepts_dir, output_dir, api_state)
+        _tab_audit(work_dir, concepts_dir, output_dir, api_state)
+        _tab_validate(work_dir, concepts_dir, output_dir, api_state)
+        _tab_organize(work_dir, concepts_dir, output_dir, api_state)
 
         # Manifest Reviewer — the whole reason this launcher exists.
-        _tab_manifest_reviewer()
+        _tab_manifest_reviewer(last_manifest_state, work_dir)
 
         # API keys, install-check, python-exe override (polished in step 7).
         _tab_settings(api_state)
