@@ -10,3 +10,4 @@ Keep each entry under 15 words. Prune stale entries as the code evolves.
 - 2026-04-16 — gradio 4.x didn't cap huggingface-hub<1; use gradio>=5 to avoid HfFolder ImportError
 - 2026-04-16 — Pinokio venv path: `venv:"../env"` + `path:"app"` puts env at repo root, not `app/env`
 - 2026-04-16 — Pinokio start.js must use `python -u` + PYTHONUNBUFFERED=1 or URL regex never matches
+- 2026-04-16 — Set PYTHONUTF8=1 in subprocess env on Windows or Klippbok's ffprobe reader crashes on cp1252

@@ -41,7 +41,19 @@ def stream_command(
     so both streams are interleaved in display order. Never use
     capture_output=True here — it would buffer the entire run.
     """
-    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    # CLAUDE-NOTE: PYTHONUTF8=1 puts the Klippbok child process (and any
+    # subprocess it spawns — ffprobe, CLIP downloads, etc.) into Python's
+    # UTF-8 Mode. Without this on Windows, Python defaults to cp1252 and any
+    # non-ASCII byte in a video filename or ffmpeg output crashes an internal
+    # reader thread with UnicodeDecodeError: 'charmap' codec can't decode ...
+    # PYTHONIOENCODING is belt-and-suspenders for older paths that don't
+    # consult PYTHONUTF8.
+    env = {
+        **os.environ,
+        "PYTHONUNBUFFERED": "1",
+        "PYTHONUTF8": "1",
+        "PYTHONIOENCODING": "utf-8",
+    }
     if extra_env:
         env.update({k: v for k, v in extra_env.items() if v})
 
@@ -52,7 +64,14 @@ def stream_command(
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             bufsize=1,
+            # CLAUDE-NOTE: Explicit encoding="utf-8" errors="replace" so OUR
+            # read of the child's stdout survives any rogue bytes (e.g. an
+            # ffmpeg progress line written in a different codec). Without
+            # these, `text=True` falls back to locale.getpreferredencoding()
+            # which is cp1252 on Windows — same crash as the child.
             text=True,
+            encoding="utf-8",
+            errors="replace",
             env=env,
             cwd=cwd,
         )
