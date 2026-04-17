@@ -355,6 +355,24 @@ def create_workspace(cfg: WorkspaceConfig) -> tuple[bool, str]:
         knowledge_count, knowledge_errors = _copy_knowledge_files(
             knowledge_source, workspace / "knowledge"
         )
+    else:
+        # CLAUDE-NOTE: Write a placeholder README so the agent finds something
+        # in knowledge/ and knows what to do rather than hitting a missing-dir
+        # error. The README tells the user how to populate the folder.
+        _knowledge_placeholder = workspace / "knowledge" / "README.md"
+        if not _knowledge_placeholder.exists():
+            _knowledge_placeholder.write_text(
+                "# Knowledge Base\n\n"
+                "This folder should contain training knowledge files for the orchestration agent.\n\n"
+                "To populate it, place `.md` files here covering your target architectures\n"
+                "(e.g. `wan22_training.md`, `flux2_klein_training.md`, `ltx23_training.md`,\n"
+                "`common_failures.md`, `hardware_profiles.md`). Each file should start with\n"
+                "a confidence rating line: `CONFIDENCE: HIGH / MEDIUM / LOW / INSUFFICIENT DATA`.\n\n"
+                "See the Pipeline Guide for how to build a knowledge base using the research\n"
+                "agent workflow. You can also set the `KNOWLEDGE_BASE_DIR` environment variable\n"
+                "to point at an existing reviewed/ folder and re-create this workspace.\n",
+                encoding="utf-8",
+            )
 
     # Always write these; they're templates that should refresh on each run
     # so path auto-detection picks up newly-installed companions.
@@ -412,6 +430,168 @@ def create_workspace(cfg: WorkspaceConfig) -> tuple[bool, str]:
 
 
 # ------------------------------------------------------ agent instructions
+
+# CLAUDE-NOTE: Each block is a regular string (not an f-string). The render
+# function calls .format(root_path=cfg.root_path) on each block so {root_path}
+# is substituted with the actual workspace root before insertion into the
+# f-string template. Keep all other literal braces escaped as {{ }}.
+_PHASE0_DOWNLOAD_BLOCKS: dict[str, str] = {
+    "Wan 2.2": """\
+### Wan 2.2
+
+**Source repos:**
+- `Wan-AI/Wan2.2-T2V-A14B` (high/low-noise DiTs)
+- `Wan-AI/Wan2.1-T2V-14B` (VAE + T5 encoder)
+
+Required files:
+- `wan2.2_t2v_high_noise_14B_fp16.safetensors` (~28 GB) — high-noise DiT
+- `wan2.2_t2v_low_noise_14B_fp16.safetensors` (~28 GB) — low-noise DiT
+- `wan_2.1_vae.safetensors` — VAE (shared with Wan 2.1)
+- `umt5-xxl-enc-bf16.pth` — T5 text encoder
+
+```bash
+huggingface-cli download Wan-AI/Wan2.2-T2V-A14B --local-dir {root_path}/models/wan22/
+huggingface-cli download Wan-AI/Wan2.1-T2V-14B wan_2.1_vae.safetensors umt5-xxl-enc-bf16.pth --local-dir {root_path}/models/wan22/
+```
+
+⚠️ Do NOT use quantized files from Wan2GP (filenames ending in `_mbf16` or `_gguf`).
+Training requires the full fp16 checkpoints.
+""",
+
+    "HunyuanVideo": """\
+### HunyuanVideo
+
+Read the `musubi://docs/hunyuan_video` MCP resource for current repo names and
+file lists — these change with model updates.
+
+Required components (approximate sizes):
+- HunyuanVideo DiT checkpoint (~14 GB)
+- VAE
+- LLaMA-based LLM text encoder (~7 GB)
+- CLIP text encoder
+
+⚠️ Budget ~30–40 GB disk space total.
+""",
+
+    "HunyuanVideo 1.5": """\
+### HunyuanVideo 1.5
+
+Read the `musubi://docs/hunyuan_video` MCP resource for current repo names and
+file lists. HunyuanVideo 1.5 uses updated weights with the same training pipeline.
+""",
+
+    "FramePack": """\
+### FramePack
+
+FramePack reuses Wan 2.1/2.2 base model files with additional FramePack-specific
+weights. Download Wan 2.2 first (see above), then read the `musubi://docs/framepack`
+MCP resource for any FramePack-specific additions.
+""",
+
+    "FLUX.2 Klein 9B": """\
+### FLUX.2 Klein 9B
+
+Read the `musubi://docs/flux_2` MCP resource for the exact HuggingFace repo paths —
+they may change between releases.
+
+Required files (approximate):
+- Klein **base** DiT checkpoint (`klein-base-9b`, ~18 GB)
+- VAE (`ae.safetensors`, ~335 MB)
+- Qwen3 8B text encoder (~16 GB, or fp8 quantized ~8 GB)
+
+```bash
+huggingface-cli download <klein-base-9b-repo> --local-dir {root_path}/models/flux2_klein/
+```
+
+⚠️ CRITICAL: Training MUST use `klein-base-9b`. The distilled `klein-9b` (inference
+model) will NOT train correctly — it lacks the residual structure needed for LoRA.
+Set `--model_version klein-base-9b` in every training command.
+""",
+
+    "FLUX.2 Dev": """\
+### FLUX.2 Dev
+
+Read the `musubi://docs/flux_2` MCP resource for the exact HuggingFace repo paths.
+
+Required files (approximate):
+- Dev DiT checkpoint (~18 GB)
+- VAE (`ae.safetensors`) — same file as Klein
+- Mistral 3 Small text encoder (~7 GB)
+
+⚠️ Official Musubi docs recommend training on `klein-base-9b` instead. Use FLUX.2 Dev
+only if you specifically need the full-size model's parameter count.
+⚠️ `--fp8_text_encoder` is NOT supported for Dev (Mistral 3 doesn't support FP8).
+""",
+
+    "FLUX.1 Kontext": """\
+### FLUX.1 Kontext
+
+Read the `musubi://docs/flux_2` MCP resource or Musubi Tuner documentation for
+current download instructions. Limited community training data — check the
+`INSUFFICIENT DATA` flag in the knowledge base before proceeding.
+""",
+
+    "Z-Image": """\
+### Z-Image Base
+
+Read the `musubi://docs/zimage` MCP resource for the exact HuggingFace repo paths.
+
+Required files (approximate):
+- Z-Image **Base** DiT checkpoint (NOT Turbo)
+- Z-Image VAE
+- Z-Image text encoder
+
+```bash
+huggingface-cli download <zimage-base-repo> --local-dir {root_path}/models/zimage/
+```
+
+⚠️ Use the Base model for training, not Turbo. Base produces more stable LoRA gradients;
+Turbo is distilled for inference speed and is not suitable for training.
+""",
+
+    "Qwen-Image": """\
+### Qwen-Image
+
+Read Musubi Tuner documentation for current download instructions.
+Limited community training data — check the `INSUFFICIENT DATA` flag before proceeding.
+""",
+
+    "Kandinsky 5": """\
+### Kandinsky 5
+
+Read Musubi Tuner documentation for current download instructions.
+Limited community training data — check the `INSUFFICIENT DATA` flag before proceeding.
+""",
+
+    "LTX-2.3": """\
+### LTX-2.3
+
+**Source repo:** `Lightricks/LTX-Video` on HuggingFace
+
+Required files:
+- `ltx-2.3-22b-dev.safetensors` (~44 GB) — full BF16 base checkpoint (training)
+- `ltx-2.3-spatial-upscaler-x2-1.0.safetensors` (~2 GB) — inference upscaler
+- `ltx-2.3-22b-distilled-lora-384.safetensors` (~500 MB) — distilled LoRA for fast inference
+- Gemma 3 12B text encoder — full directory `google/gemma-3-12b-it-qat-q4_0-unquantized` (~24 GB)
+
+```bash
+huggingface-cli download Lightricks/LTX-Video ltx-2.3-22b-dev.safetensors --local-dir {root_path}/models/ltx23/
+huggingface-cli download Lightricks/LTX-Video ltx-2.3-spatial-upscaler-x2-1.0.safetensors --local-dir {root_path}/models/ltx23/
+huggingface-cli download Lightricks/LTX-Video ltx-2.3-22b-distilled-lora-384.safetensors --local-dir {root_path}/models/ltx23/
+huggingface-cli download google/gemma-3-12b-it-qat-q4_0-unquantized --local-dir {root_path}/models/ltx23/gemma/
+```
+
+After downloading, update paths via the LTX-Trainer Pinokio UI:
+- **Project tab → Scan folder** — paste `{root_path}/models/ltx23/` and click Scan to auto-detect
+- Or run `ltx_check_installation` via the MCP tool to verify paths
+
+⚠️ LTX-2.3 uses its own trainer (ltx-trainer), NOT Musubi Tuner.
+⚠️ Training requires Linux or WSL2 (triton/bitsandbytes are Linux-only).
+⚠️ Do NOT use FP8-quantized or community-reposted variants with the same filename —
+   they are inference-only and will fail silently during training. The scanner in the
+   LTX-Trainer UI detects quantized models automatically via the safetensors header.
+""",
+}
 
 
 _TARGET_TRAINING_BLOCKS: dict[str, str] = {
@@ -530,6 +710,19 @@ def render_agent_instructions(
     workspace = cfg.workspace_dir()
     targets = cfg.targets or ["(none selected — add target blocks manually)"]
 
+    # Phase 0 — one download block per selected target, with {root_path} substituted.
+    phase0_sections: list[str] = []
+    for t in cfg.targets:
+        block = _PHASE0_DOWNLOAD_BLOCKS.get(t)
+        if block:
+            phase0_sections.append(block.format(root_path=cfg.root_path))
+    if not phase0_sections:
+        phase0_sections.append(
+            "### No target models selected\n\n"
+            "Re-scaffold the workspace with target models ticked to get\n"
+            "architecture-specific download instructions here."
+        )
+
     target_sections: list[str] = []
     for t in cfg.targets:
         block = _TARGET_TRAINING_BLOCKS.get(t)
@@ -626,9 +819,50 @@ convenient in your agent.
 Anything marked `<NOT FOUND>` above needs to be set manually — either in this
 file or via environment variables before the agent starts.
 
+## Recommended execution order
+
+1. **Phase 0: Download models** — get the correct full-precision base models for your target architectures
+2. **Phase 1: Dataset curation** — scan, caption, validate your source material
+3. **Phase 2: Training** — cache latents, cache text encoder, train
+4. **Phase 3: Watchdog** — activate before walking away from any training run
+5. **Phase 4: Evaluation** — check results, pick best checkpoint, iterate
+
+For a first-time test, start with your smallest dataset on the fastest architecture
+(image models like FLUX.2 Klein train faster than video models like Wan 2.2).
+
 ## Pipeline execution plan
 
 Follow these phases in order. Each is driven through MCP tools.
+
+### Phase 0 — Download base models
+
+**Do this first.** Training requires full-precision (bf16/fp16) model checkpoints.
+Quantized inference models from Wan2GP, ComfyUI, or similar tools will NOT work
+for training even when they share the exact same filename as the correct checkpoint.
+
+Verify the environment first:
+- For Musubi-based models: `musubi_check_installation`
+- For LTX-2.3: `ltx_check_installation`
+
+**Suggested model directory layout:**
+
+```
+{cfg.root_path}/models/
+├── wan22/         ← Wan 2.2 DiTs + VAE + T5 encoder
+├── flux2_klein/   ← Klein-base-9b + VAE + Qwen3 encoder
+├── zimage/        ← Z-Image Base + VAE + text encoder
+└── ltx23/         ← LTX-2.3 checkpoint + Gemma encoder
+```
+
+{chr(10).join(phase0_sections)}
+
+After downloading, tell the agent the model paths:
+
+> "Models downloaded to `{cfg.root_path}/models/`. Here are the locations:
+> - [architecture]: [path]
+> Update model paths in training configurations accordingly."
+
+The agent will use these paths when creating latent-cache configs and training commands.
 
 ### Phase 1 — Dataset curation (Klippbok)
 
@@ -1104,6 +1338,13 @@ Replace `<path-to>` with your actual install paths. The workspace's
 
 Use the **Create Training Workspace** button above to scaffold a project
 folder. Then add your source clips/images to the `datasets/` folder.
+
+**Note:** After creating your workspace, the first thing the agent will do is
+help you download the correct base models for training. Quantized models from
+inference tools (Wan2GP, ComfyUI, etc.) do NOT work for training — you need the
+full-precision checkpoints. Budget 30–80 GB of downloads per architecture depending
+on model size. The generated `AGENT_INSTRUCTIONS.md` includes architecture-specific
+download commands with exact file names and HuggingFace repo paths.
 
 ## Step 4 — Start the agent
 
