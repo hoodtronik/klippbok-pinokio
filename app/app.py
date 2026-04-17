@@ -28,6 +28,7 @@ from typing import Iterator
 import gradio as gr
 
 import manifest as mft
+import pipeline_setup as pipe
 import runner
 
 
@@ -1528,6 +1529,113 @@ def _tab_settings(api_state: gr.State) -> None:
         check_btn.click(_check_installation, outputs=action_log)
 
 
+# ----- Agentic Pipeline (workspace scaffolder + guide) -------------------
+
+
+def _tab_agentic_pipeline() -> None:
+    """Front door for the agent-driven LoRA training pipeline.
+
+    This tab scaffolds a project workspace and serves the setup guide.
+    It does NOT do any training itself — training runs through MCP
+    servers that the user drives from Claude Desktop / Antigravity /
+    etc. See pipeline_setup.py for the workspace layout and the
+    generated AGENT_INSTRUCTIONS.md / PIPELINE_GUIDE.md / watchdog.py
+    templates.
+    """
+    # CLAUDE-NOTE: Default root path prefers F:/__PROJECTS if it exists
+    # (this user's pattern); otherwise falls back to the user's home
+    # directory. Works cross-platform since Path.home() is universal.
+    default_root_candidates = [
+        Path("F:/__PROJECTS"),
+        Path.home() / "Projects",
+        Path.home(),
+    ]
+    default_root = str(next((p for p in default_root_candidates if p.exists()), Path.home()))
+
+    with gr.Tab("Agentic Pipeline"):
+        gr.Markdown(
+            "## Agentic Pipeline\n"
+            "Set up a workspace for agent-driven LoRA training that chains"
+            " **Klippbok** (this app) → **Musubi Tuner** → **LTX-2.3 Trainer**"
+            " through MCP servers. No training happens in this tab — it"
+            " scaffolds the folder structure and drops a walkthrough + agent"
+            " prompt template + watchdog script into the workspace.\n\n"
+            "*Pipeline designed by [hoodtronik](https://github.com/hoodtronik).*"
+        )
+
+        # ---- Section 1: create workspace ------------------------------
+        with gr.Accordion("1. Create training workspace", open=True):
+            project_name = gr.Textbox(
+                label="Project name",
+                value="MyLoRAProject",
+                info="Filesystem-safe name. Becomes the top-level folder.",
+            )
+            with gr.Row():
+                root_path = gr.Textbox(
+                    label="Root path",
+                    value=default_root,
+                    info="Where the project folder will be created. Auto-detected where possible.",
+                    scale=4,
+                )
+                root_browse = gr.Button("Browse…", scale=0, size="sm", min_width=0)
+                root_browse.click(_pick_folder, outputs=root_path)
+
+            with gr.Accordion("Advanced options", open=False):
+                styles_box = gr.Textbox(
+                    label="Style subfolders under datasets/",
+                    placeholder="blur_studio\nneon_noir\ncinematic_realism",
+                    lines=4,
+                    info="One per line. Leave blank for a flat datasets/ folder.",
+                )
+                strategy = gr.Dropdown(
+                    label="Training strategy",
+                    choices=list(pipe.STRATEGIES),
+                    value=pipe.DEFAULT_STRATEGY,
+                    info="Layered creates outputs/master_loras/ + outputs/boutique_loras/. "
+                         "Single creates outputs/loras/. Custom leaves outputs/ empty for you to organize.",
+                )
+                targets = gr.CheckboxGroup(
+                    label="Target models",
+                    choices=list(pipe.TARGET_MODELS),
+                    value=[],
+                    info="Tick the models you plan to train. Shapes the AGENT_INSTRUCTIONS.md "
+                         "template so the agent gets trainer-specific guidance for each.",
+                )
+
+            create_btn = gr.Button("Create workspace", variant="primary")
+            status_box = gr.Code(
+                label="Result",
+                language=None,
+                value="",
+                interactive=False,
+                visible=False,
+            )
+
+            def _on_create(name, root, styles_text, strat, tgts):
+                # CLAUDE-NOTE: Textbox-per-line is simpler than a dynamic
+                # row list and does the same job for a short set of names.
+                styles = [s.strip() for s in (styles_text or "").splitlines() if s.strip()]
+                cfg = pipe.WorkspaceConfig(
+                    project_name=(name or "").strip(),
+                    root_path=(root or "").strip(),
+                    styles=styles,
+                    strategy=strat or pipe.DEFAULT_STRATEGY,
+                    targets=tgts or [],
+                )
+                _ok, message = pipe.create_workspace(cfg)
+                return gr.update(value=message, visible=True)
+
+            create_btn.click(
+                _on_create,
+                inputs=[project_name, root_path, styles_box, strategy, targets],
+                outputs=status_box,
+            )
+
+        # ---- Section 2: pipeline guide --------------------------------
+        with gr.Accordion("2. Pipeline guide (also written to the workspace)", open=False):
+            gr.Markdown(pipe.PIPELINE_GUIDE_MD)
+
+
 # ----- Manifest Reviewer --------------------------------------------------
 
 
@@ -1871,6 +1979,11 @@ def build_ui() -> gr.Blocks:
 
         # API keys, install-check, python-exe override (polished in step 7).
         _tab_settings(api_state)
+
+        # Front door to the agent-driven training pipeline (Klippbok ->
+        # Musubi/LTX trainers via MCP). Scaffolds a workspace + docs; does
+        # NOT do any training itself. Pipeline designed by hoodtronik.
+        _tab_agentic_pipeline()
 
     return demo
 
