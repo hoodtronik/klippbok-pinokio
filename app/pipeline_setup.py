@@ -486,6 +486,13 @@ The watchdog will terminate the training process and write
 `watchdog_report.json` if loss explodes, hits NaN/Inf, or plateaus. Safe to
 walk away from a long run once the watchdog is active.
 
+**Run the watchdog in the same environment as the trainer.** If training
+runs inside WSL2, launch the watchdog from inside WSL2 too — Windows and
+WSL2 have separate PID namespaces, so a Windows-side watchdog can't see
+or kill a WSL2 training process. The watchdog auto-picks the right kill
+primitive on each side (taskkill /F /T on Windows for process-tree kill,
+SIGTERM then SIGKILL on POSIX).
+
 ### Phase 4 — Evaluation
 
 After each LoRA finishes:
@@ -547,9 +554,25 @@ Tails a log file, parses loss values, and terminates the target process
 Writes `watchdog_report.json` to the log file's parent directory (or
 cwd) on exit so the calling agent can inspect why the run stopped.
 
-Stdlib only: argparse, json, os, pathlib, re, signal, sys, time. Works
-on Windows (CTRL_BREAK_EVENT + TerminateProcess) and POSIX (SIGTERM /
-SIGKILL).
+**Run this in the same environment as the trainer.** Windows cannot see
+WSL2 PIDs and vice versa — if training runs inside WSL2, launch this
+watchdog inside WSL2 too. Otherwise the PID lookup will fail or, worse,
+hit an unrelated Windows process with the same number.
+
+Process-kill strategy:
+
+  * Windows native: `taskkill /F /T /PID <pid>` (tree kill — catches
+    torchrun / accelerate / DataLoader worker children that a plain
+    TerminateProcess would orphan, leaving GPU memory wired up). Falls
+    back to direct TerminateProcess via ctypes if `taskkill` is not on
+    PATH (stripped Windows setups).
+  * POSIX (incl. WSL2): SIGTERM, wait 3s, escalate to SIGKILL. Signals
+    hit only the target PID — trainers that fork worker pools should
+    install their own SIGTERM handler to tear them down, or the run
+    script should use `setsid` so the group can be killed by PGID.
+
+Stdlib only: argparse, json, math, os, pathlib, re, signal, subprocess,
+sys, time.
 
 Usage:
   python watchdog.py --log-file <path> --pid <pid> \\
@@ -564,6 +587,7 @@ import math
 import os
 import re
 import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -590,9 +614,36 @@ def parse_loss(line: str) -> Optional[float]:
 
 
 def kill_pid(pid: int) -> tuple[bool, str]:
-    """Terminate the target process cross-platform. Returns (killed, method)."""
+    """Terminate the target process (and on Windows its children) cross-platform.
+
+    Returns ``(killed, method)``. Method is a short string describing what
+    actually landed so `watchdog_report.json` is diagnosable after the fact.
+    """
     try:
         if os.name == "nt":
+            # Primary path: taskkill /F /T walks the process tree and kills
+            # the parent + all descendants. Training runs spawn worker
+            # processes (torchrun, accelerate launch, DataLoader workers
+            # holding GPU memory); a direct TerminateProcess would orphan
+            # them. We prefer taskkill because it's tree-aware.
+            try:
+                r = subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(pid)],
+                    capture_output=True,
+                    timeout=10,
+                )
+                if r.returncode == 0:
+                    return True, "taskkill /F /T"
+                # Exit 128 = process not found — likely already exited.
+                if r.returncode == 128:
+                    return False, f"pid {pid} not found (already exited?)"
+                # Anything else: try the fallback path below.
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                pass
+
+            # Fallback: direct TerminateProcess via ctypes. Single PID only;
+            # worker children may survive and hold GPU memory — manual
+            # cleanup required if this path is taken.
             import ctypes
 
             PROCESS_TERMINATE = 1
@@ -602,10 +653,11 @@ def kill_pid(pid: int) -> tuple[bool, str]:
                 return False, f"OpenProcess failed for pid={pid}"
             ok = kernel32.TerminateProcess(handle, 1)
             kernel32.CloseHandle(handle)
-            return bool(ok), "TerminateProcess"
+            return bool(ok), "TerminateProcess (fallback, single PID only)"
         else:
             os.kill(pid, signal.SIGTERM)
-            # Grace period, then escalate.
+            # Grace period — well-behaved trainers handle SIGTERM and clean
+            # up worker pools. Escalate if they don't exit within 3s.
             for _ in range(30):
                 time.sleep(0.1)
                 try:
@@ -909,8 +961,22 @@ python watchdog.py \\
     --plateau-steps 500
 ```
 
-The script writes `watchdog_report.json` on exit describing why it stopped.
-Stdlib only — no extra deps.
+The script writes `watchdog_report.json` on exit describing why it
+stopped. Stdlib only — no extra deps.
+
+**Run the watchdog in the same environment as the trainer.** If your
+trainer runs inside WSL2, launch the watchdog from inside WSL2 too —
+Windows cannot see WSL2 process IDs and vice versa. The watchdog
+auto-detects its host OS and picks the right kill primitive:
+
+- **Windows native**: `taskkill /F /T /PID <pid>` (process-tree kill,
+  catches torchrun / accelerate / DataLoader workers that would
+  otherwise orphan and keep GPU memory wired up). Falls back to direct
+  TerminateProcess via ctypes if `taskkill` is unavailable.
+- **WSL2 / Linux / macOS**: SIGTERM → wait 3s → SIGKILL on the target
+  PID. Well-behaved trainers install their own SIGTERM handler to clean
+  up worker pools; trainers that don't should be launched via `setsid`
+  so the whole process group can be killed explicitly.
 
 ## GPU requirements
 
