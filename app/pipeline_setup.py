@@ -6,7 +6,7 @@ watchdog script) out of app.py so the UI file stays focused on Gradio
 wiring.
 
 Design invariants:
-  * stdlib only — no new pip deps. pathlib, os, shutil, platform, subprocess.
+  * stdlib only — no new pip deps. pathlib, os, platform, subprocess.
   * Auto-detection of companion tools fails gracefully. Missing tools get
     a `<NOT FOUND — set this path>` placeholder so the user knows to fill
     it in manually rather than crash on workspace creation.
@@ -23,25 +23,49 @@ from __future__ import annotations
 
 import os
 import platform
-import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+import pipeline_installer as pi  # fresh import; no circular risk
+
 
 # --------------------------------------------------------------- targets
 
 
-# Target models a user can tick in Advanced mode. The order here is the
-# order they appear in the checkbox group and in generated instructions.
-TARGET_MODELS: tuple[str, ...] = (
+# Target models grouped by trainer + modality so the UI can render them
+# in meaningful clusters (video-via-Musubi / image-via-Musubi / other).
+#
+# VIDEO_TARGETS_MUSUBI and IMAGE_TARGETS_MUSUBI are the Musubi-Tuner
+# supported lineup. VIDEO_TARGETS_OTHER is for trainers that are NOT
+# Musubi (currently just LTX-2.3 on the Lightricks LTX-2 trainer).
+# TARGET_MODELS is the flat concatenation used by callers that don't
+# care about the grouping.
+VIDEO_TARGETS_MUSUBI: tuple[str, ...] = (
     "Wan 2.2",
-    "FLUX.2 Klein 9B",
-    "Z-Image",
-    "LTX-2.3",
     "HunyuanVideo",
+    "HunyuanVideo 1.5",
     "FramePack",
+)
+
+IMAGE_TARGETS_MUSUBI: tuple[str, ...] = (
+    "FLUX.2 Klein 9B",
+    "FLUX.2 Dev",
+    "FLUX.1 Kontext",
+    "Z-Image",
+    "Qwen-Image",
+    "Kandinsky 5",
+)
+
+VIDEO_TARGETS_OTHER: tuple[str, ...] = (
+    "LTX-2.3",
+)
+
+TARGET_MODELS: tuple[str, ...] = (
+    *VIDEO_TARGETS_MUSUBI,
+    *IMAGE_TARGETS_MUSUBI,
+    *VIDEO_TARGETS_OTHER,
 )
 
 STRATEGIES: tuple[str, ...] = (
@@ -278,10 +302,17 @@ def create_workspace(cfg: WorkspaceConfig) -> tuple[bool, str]:
     # Always write these; they're templates that should refresh on each run
     # so path auto-detection picks up newly-installed companions.
     detected = detect_paths()
+    # CLAUDE-NOTE: Install Root == Workspace Root per user's design choice,
+    # so we detect under cfg.root_path (not workspace.parent). This feeds
+    # the MCP Server Configuration JSON block in AGENT_INSTRUCTIONS.md.
+    try:
+        statuses = pi.detect_all(Path(cfg.root_path))
+    except Exception:
+        statuses = {}
     try:
         (workspace / "PIPELINE_GUIDE.md").write_text(PIPELINE_GUIDE_MD, encoding="utf-8")
         (workspace / "AGENT_INSTRUCTIONS.md").write_text(
-            render_agent_instructions(cfg, detected), encoding="utf-8"
+            render_agent_instructions(cfg, detected, statuses=statuses), encoding="utf-8"
         )
         (workspace / "watchdog.py").write_text(WATCHDOG_PY, encoding="utf-8")
     except OSError as exc:
@@ -321,10 +352,10 @@ def create_workspace(cfg: WorkspaceConfig) -> tuple[bool, str]:
 
 _TARGET_TRAINING_BLOCKS: dict[str, str] = {
     "Wan 2.2": """\
-### Wan 2.2 (via Musubi Tuner)
+### Wan 2.2 (via Musubi Tuner — video)
 
-Uses `musubi-tuner` with the Wan 2.2 cache + training scripts. Call via the
-`musubi-mcp` tool set.
+Video LoRA. Uses `musubi-tuner` with the Wan 2.2 cache + training scripts.
+Call via the `musubi-mcp` tool set.
 
 Key flags the agent should consider:
   - Target rank: Master 128, Boutique 32-64 (Layered strategy)
@@ -333,12 +364,33 @@ Key flags the agent should consider:
   - learning_rate: 1e-4 for Master, 5e-5 for Boutique
   - max_train_steps: 2000-3000 Master, 500-800 Boutique
 """,
-    "FLUX.2 Klein 9B": """\
-### FLUX.2 Klein 9B (via Musubi Tuner)
+    "HunyuanVideo": """\
+### HunyuanVideo (via Musubi Tuner — video)
 
-Requires the FLUX.2 cache + training scripts. Image-only dataset (no video
-normalization needed — skip Ingest, go Scan -> Triage -> Caption -> Validate
--> Organize).
+Tencent HunyuanVideo LoRA training. Uses musubi-tuner's hunyuan scripts.
+See musubi-tuner docs for the correct cache prep — HunyuanVideo dataset
+format differs from Wan 2.2.
+""",
+    "HunyuanVideo 1.5": """\
+### HunyuanVideo 1.5 (via Musubi Tuner — video)
+
+Updated Hunyuan. Cache + training harness similar to HunyuanVideo but
+check musubi-tuner's current hunyuan_1_5 branch for the latest scripts —
+flag surface and resolution caps shift between minor releases.
+""",
+    "FramePack": """\
+### FramePack (via Musubi Tuner — video, frame-sequence)
+
+FramePack is frame-sequence-based rather than video-clip-based. Dataset
+layout differs from Wan/Hunyuan — consult musubi-tuner's FramePack docs
+before running. Klippbok's Ingest output usually needs reshaping before
+feeding it to FramePack.
+""",
+    "FLUX.2 Klein 9B": """\
+### FLUX.2 Klein 9B (via Musubi Tuner — image)
+
+Image LoRA. Requires the FLUX.2 cache + training scripts. Image-only
+dataset (skip Ingest; go Scan -> Triage -> Caption -> Validate -> Organize).
 
 Key flags:
   - Resolution: 1024 or 1440 depending on source quality
@@ -346,40 +398,71 @@ Key flags:
   - fp8 + gradient_checkpointing: on <24GB
   - learning_rate: 1e-4 to 5e-5
 """,
+    "FLUX.2 Dev": """\
+### FLUX.2 Dev (via Musubi Tuner — image)
+
+Image LoRA on the developer-tier FLUX.2 checkpoint. Larger base than
+Klein 9B. Training knobs resemble FLUX.2 Klein 9B but expect higher VRAM
+floors. Check musubi-tuner docs for the current flux_2_dev config.
+""",
+    "FLUX.1 Kontext": """\
+### FLUX.1 Kontext (via Musubi Tuner — image)
+
+FLUX.1 Kontext context-editing LoRA. Image input pairs (source + target
+images). Classical FLUX.1 LoRA flags apply (rank 32-64, fp8 below 24GB);
+dataset layout requires paired captions so Klippbok's Caption tab needs
+configuration attention.
+""",
     "Z-Image": """\
-### Z-Image (via Musubi Tuner)
+### Z-Image (via Musubi Tuner — image)
 
 Tongyi-MAI/Z-Image fine-tuning pipeline. See musubi-tuner docs for the
 Z-Image specific cache prep.
 """,
-    "LTX-2.3": """\
-### LTX-2.3 (via LTX-2 trainer)
+    "Qwen-Image": """\
+### Qwen-Image (via Musubi Tuner — image)
 
-Lightricks' official trainer, driven through `ltx-trainer-mcp`. Separate from
-Musubi entirely — different dataset format, different cache pipeline.
+Alibaba Qwen-Image LoRA. Image dataset. Consult musubi-tuner's qwen_image
+config for resolution, rank, and fp8 recommendations current to your
+installed version.
+""",
+    "Kandinsky 5": """\
+### Kandinsky 5 (via Musubi Tuner — image)
+
+Kandinsky 5 LoRA. Image dataset. Musubi-tuner's kandinsky_5 scripts
+handle the cache + training. Newer addition to musubi's lineup — verify
+flag surface against the repo's current docs.
+""",
+    "LTX-2.3": """\
+### LTX-2.3 (via LTX-2 trainer — video, **NOT Musubi**)
+
+Lightricks' official trainer, driven through `ltx-trainer-mcp`. Separate
+from Musubi entirely — different dataset format, different cache pipeline.
+Do NOT use `musubi-mcp` for LTX-2.3.
 
 Key flags:
   - INT8 low-VRAM config for <32GB cards
   - Standard config wants 80GB+
   - Video clips only; image datasets not supported
   - Run after Klippbok has produced a normalized clip set
-""",
-    "HunyuanVideo": """\
-### HunyuanVideo (via Musubi Tuner)
-
-Tencent HunyuanVideo LoRA training. Uses musubi-tuner's hunyuan scripts.
-""",
-    "FramePack": """\
-### FramePack (via Musubi Tuner)
-
-FramePack is frame-sequence-based. Dataset layout differs from regular
-Wan/FLUX — consult musubi-tuner FramePack docs before running.
+  - Linux / WSL2 only for training itself (repo installs fine on Windows)
 """,
 }
 
 
-def render_agent_instructions(cfg: WorkspaceConfig, detected: DetectedPaths) -> str:
-    """Fill in the AGENT_INSTRUCTIONS.md template from the config + auto-detected paths."""
+def render_agent_instructions(
+    cfg: WorkspaceConfig,
+    detected: DetectedPaths,
+    statuses: Optional[dict] = None,
+) -> str:
+    """Fill in the AGENT_INSTRUCTIONS.md template from the config + detected paths.
+
+    ``statuses`` is the dict returned by ``pipeline_installer.detect_all``.
+    When provided, the generated file includes a ready-to-paste MCP Server
+    Configuration JSON block — only servers whose trainer + MCP server are
+    both installed appear. When omitted (back-compat path), that section
+    is skipped and the user has to assemble the JSON by hand.
+    """
     workspace = cfg.workspace_dir()
     targets = cfg.targets or ["(none selected — add target blocks manually)"]
 
@@ -407,11 +490,33 @@ def render_agent_instructions(cfg: WorkspaceConfig, detected: DetectedPaths) -> 
         else "  (no style subfolders configured)"
     )
 
+    if statuses:
+        mcp_json = pi.render_mcp_config(statuses)
+        mcp_config_section = f"""
+## MCP Server Configuration
+
+Copy-paste this JSON into your agent's MCP configuration (Antigravity
+settings, Claude Desktop `claude_desktop_config.json`, Cursor's
+`.cursor/mcp.json`, or the Claude Code CLI via `claude mcp add`):
+
+```json
+{mcp_json}
+```
+
+Only servers whose trainer + MCP server are both installed appear above.
+If a server is missing, install it from the Pipeline Status panel in the
+Agentic Pipeline tab, then re-create this workspace — the JSON will
+expand automatically.
+"""
+    else:
+        mcp_config_section = ""
+
     return f"""\
 # Agent Instructions — {cfg.project_name}
 
 *Pipeline designed by [hoodtronik](https://github.com/hoodtronik). This workspace
 was scaffolded by the Klippbok Pinokio launcher's Agentic Pipeline tab.*
+{mcp_config_section}
 
 ## Workspace
 

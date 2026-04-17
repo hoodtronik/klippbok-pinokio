@@ -5,6 +5,9 @@ cache/
 # Secrets
 .env
 
+# Pipeline Status panel persistence (detected install paths per machine)
+.user_settings.json
+
 # Generated at install time from `python -m klippbok ... --help`
 docs/cli_help.txt
 

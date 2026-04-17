@@ -28,6 +28,7 @@ from typing import Iterator
 import gradio as gr
 
 import manifest as mft
+import pipeline_installer as pi
 import pipeline_setup as pipe
 import runner
 
@@ -1552,33 +1553,134 @@ def _tab_agentic_pipeline() -> None:
     ]
     default_root = str(next((p for p in default_root_candidates if p.exists()), Path.home()))
 
+    # Per-target required-components map (used by the Create pre-flight
+    # warning). Every Musubi-supported target maps to musubi_tuner +
+    # musubi_mcp; LTX-2.3 uses its own trainer stack. If new targets are
+    # added to pipeline_setup.TARGET_MODELS, add matching entries here.
+    _musubi_deps = ["musubi_tuner", "musubi_mcp"]
+    TARGET_DEPS = {t: _musubi_deps for t in pipe.VIDEO_TARGETS_MUSUBI}
+    TARGET_DEPS.update({t: _musubi_deps for t in pipe.IMAGE_TARGETS_MUSUBI})
+    TARGET_DEPS["LTX-2.3"] = ["ltx2_trainer", "ltx_trainer_mcp"]
+
+    def _row_display(comp, status, all_statuses):
+        """Compute (icon_md, path_text, btn_text, btn_interactive) for one status row."""
+        installed = bool(status and status.installed)
+        path_text = (status.path or "") if installed else "(not installed)"
+        if comp.always_installed:
+            return "**[ok]**", path_text, "Installed", False
+        ok, reason = pi.can_install(comp, all_statuses)
+        if installed:
+            # Installed — "Update" if gate allows (uv, cloneable repos),
+            # "Installed" (disabled) otherwise (git, which has no in-panel update).
+            return (
+                ("**[ok]**", path_text, "Update", True)
+                if ok
+                else ("**[ok]**", path_text, "Installed", False)
+            )
+        # Not installed — show reason in button text when gated.
+        btn_text = "Install" if ok else f"Install ({reason})"
+        return "**[!!]**", path_text, btn_text, ok
+
     with gr.Tab("Agentic Pipeline"):
         gr.Markdown(
             "## Agentic Pipeline\n"
             "Set up a workspace for agent-driven LoRA training that chains"
             " **Klippbok** (this app) → **Musubi Tuner** → **LTX-2.3 Trainer**"
-            " through MCP servers. No training happens in this tab — it"
-            " scaffolds the folder structure and drops a walkthrough + agent"
-            " prompt template + watchdog script into the workspace.\n\n"
+            " through MCP servers. Install the pieces below, then create a"
+            " workspace — the generated `AGENT_INSTRUCTIONS.md` will be fully"
+            " pre-filled with every path your agent needs.\n\n"
             "*Pipeline designed by [hoodtronik](https://github.com/hoodtronik).*"
         )
 
-        # ---- Section 1: create workspace ------------------------------
+        # ---- Shared Root textbox (drives BOTH install location AND workspace parent) -
+        # CLAUDE-NOTE: Reused per user's design choice — one textbox at the
+        # top of the tab controls where both companion tools get cloned AND
+        # where project workspaces get created. Keeps the mental model simple.
+        with gr.Row():
+            root_path = gr.Textbox(
+                label="Root path",
+                value=default_root,
+                info="Install location for pipeline tools AND parent for project workspaces.",
+                scale=4,
+            )
+            root_browse = gr.Button("Browse…", scale=0, size="sm", min_width=0)
+            root_browse.click(_pick_folder, outputs=root_path)
+
+        # ---- Section: Pipeline Status --------------------------------
+        with gr.Accordion("Pipeline Components", open=True):
+            gr.Markdown(
+                "Install the tools you need before creating a workspace. You only"
+                " need trainers for the models you plan to use. Click **Refresh"
+                " Paths** after installing something outside this UI."
+            )
+
+            # CLAUDE-NOTE: Detect once at build time using only filesystem
+            # probes — fast and keeps app boot snappy per the user's choice.
+            # Subprocess checks (nvidia-smi, uv --version) only run when
+            # Refresh Paths or an install is clicked.
+            try:
+                _initial_root = Path(default_root)
+                _initial_statuses = pi.detect_all(_initial_root)
+            except Exception:
+                _initial_statuses = {c.id: pi.ComponentStatus(c.id, False, None) for c in pi.COMPONENTS}
+
+            status_rows: dict[str, dict] = {}
+            for comp in pi.COMPONENTS:
+                s = _initial_statuses.get(comp.id)
+                icon, path_text, btn_text, btn_enabled = _row_display(comp, s, _initial_statuses)
+                with gr.Row(equal_height=True):
+                    # CLAUDE-NOTE: gr.Markdown in Gradio 5 does NOT accept
+                    # `scale` or `min_width` kwargs (unlike Textbox / Button).
+                    # Gradio 4 allowed them; 5 removed them silently. Rely
+                    # on the surrounding Row for layout — the scale-0
+                    # Textbox/Button siblings keep the Markdown from eating
+                    # too much horizontal space.
+                    status_md = gr.Markdown(value=icon)
+                    gr.Markdown(
+                        value=f"**{comp.display_name}** — {comp.description}"
+                        + (f"  \n_{comp.install_warning}_" if comp.install_warning else "")
+                    )
+                    path_tb = gr.Textbox(
+                        value=path_text,
+                        interactive=False,
+                        show_label=False,
+                        container=False,
+                        scale=3,
+                    )
+                    install_btn = gr.Button(
+                        value=btn_text,
+                        scale=0,
+                        size="sm",
+                        interactive=btn_enabled,
+                        min_width=160,
+                    )
+                status_rows[comp.id] = {
+                    "comp": comp,
+                    "status": status_md,
+                    "path": path_tb,
+                    "button": install_btn,
+                }
+
+            with gr.Row():
+                refresh_btn = gr.Button("Refresh paths", size="sm")
+
+            install_log = gr.Textbox(
+                label="Install log",
+                lines=12,
+                max_lines=2000,
+                interactive=False,
+                autoscroll=True,
+                show_copy_button=True,
+                value="",
+            )
+
+        # ---- Section: create workspace ------------------------------
         with gr.Accordion("1. Create training workspace", open=True):
             project_name = gr.Textbox(
                 label="Project name",
                 value="MyLoRAProject",
-                info="Filesystem-safe name. Becomes the top-level folder.",
+                info="Filesystem-safe name. Becomes the top-level folder under Root path.",
             )
-            with gr.Row():
-                root_path = gr.Textbox(
-                    label="Root path",
-                    value=default_root,
-                    info="Where the project folder will be created. Auto-detected where possible.",
-                    scale=4,
-                )
-                root_browse = gr.Button("Browse…", scale=0, size="sm", min_width=0)
-                root_browse.click(_pick_folder, outputs=root_path)
 
             with gr.Accordion("Advanced options", open=False):
                 styles_box = gr.Textbox(
@@ -1592,17 +1694,43 @@ def _tab_agentic_pipeline() -> None:
                     choices=list(pipe.STRATEGIES),
                     value=pipe.DEFAULT_STRATEGY,
                     info="Layered creates outputs/master_loras/ + outputs/boutique_loras/. "
-                         "Single creates outputs/loras/. Custom leaves outputs/ empty for you to organize.",
+                         "Single creates outputs/loras/. Custom leaves outputs/ empty.",
                 )
-                targets = gr.CheckboxGroup(
-                    label="Target models",
-                    choices=list(pipe.TARGET_MODELS),
+                gr.Markdown(
+                    "**Target models** — tick every model you plan to train. "
+                    "The generated AGENT_INSTRUCTIONS.md gets a trainer-specific "
+                    "section for each."
+                )
+                gr.Markdown("_Video models (via **Musubi Tuner**)_")
+                targets_video_musubi = gr.CheckboxGroup(
+                    choices=list(pipe.VIDEO_TARGETS_MUSUBI),
                     value=[],
-                    info="Tick the models you plan to train. Shapes the AGENT_INSTRUCTIONS.md "
-                         "template so the agent gets trainer-specific guidance for each.",
+                    show_label=False,
+                    container=False,
+                )
+                gr.Markdown("_Image models (via **Musubi Tuner**)_")
+                targets_image_musubi = gr.CheckboxGroup(
+                    choices=list(pipe.IMAGE_TARGETS_MUSUBI),
+                    value=[],
+                    show_label=False,
+                    container=False,
+                )
+                gr.Markdown(
+                    "_Other trainers_  \n"
+                    "⚠ **LTX-2.3** uses Lightricks' LTX-2 trainer, **not Musubi**. "
+                    "Requires `ltx2_trainer` + `ltx_trainer_mcp` instead of the Musubi pair."
+                )
+                targets_other = gr.CheckboxGroup(
+                    choices=list(pipe.VIDEO_TARGETS_OTHER),
+                    value=[],
+                    show_label=False,
+                    container=False,
                 )
 
-            create_btn = gr.Button("Create workspace", variant="primary")
+            with gr.Row():
+                refresh_paths_btn = gr.Button("Refresh paths", size="sm")
+                create_btn = gr.Button("Create workspace", variant="primary")
+
             status_box = gr.Code(
                 label="Result",
                 language=None,
@@ -1611,29 +1739,122 @@ def _tab_agentic_pipeline() -> None:
                 visible=False,
             )
 
-            def _on_create(name, root, styles_text, strat, tgts):
-                # CLAUDE-NOTE: Textbox-per-line is simpler than a dynamic
-                # row list and does the same job for a short set of names.
+            def _on_create(name, root, styles_text, strat, tgts_video, tgts_image, tgts_other):
+                # Merge the three grouped CheckboxGroups into a single list
+                # the config + downstream template rendering already expect.
+                tgts = list(tgts_video or []) + list(tgts_image or []) + list(tgts_other or [])
                 styles = [s.strip() for s in (styles_text or "").splitlines() if s.strip()]
                 cfg = pipe.WorkspaceConfig(
                     project_name=(name or "").strip(),
                     root_path=(root or "").strip(),
                     styles=styles,
                     strategy=strat or pipe.DEFAULT_STRATEGY,
-                    targets=tgts or [],
+                    targets=tgts,
                 )
+                # Pre-flight: which components are required given the target
+                # models? klippbok-mcp is always required; each target adds
+                # its trainer + MCP. Warn but still proceed so the workspace
+                # exists (with placeholders) and the user can re-create it
+                # after installing.
+                required = {"klippbok_mcp"}
+                for t in cfg.targets:
+                    for dep in TARGET_DEPS.get(t, []):
+                        required.add(dep)
+                try:
+                    statuses = pi.detect_all(Path(cfg.root_path)) if cfg.root_path else {}
+                except Exception:
+                    statuses = {}
+                missing = [
+                    (pi.component_by_id(r).display_name if pi.component_by_id(r) else r)
+                    for r in sorted(required)
+                    if not (statuses.get(r) and statuses[r].installed)
+                ]
+                preamble = ""
+                if missing:
+                    preamble = (
+                        "[warning] These components are required by your selected targets but "
+                        "are not installed yet:\n"
+                        + "\n".join(f"  - {m}" for m in missing)
+                        + "\n\nThe workspace will still be created, but paths for the missing "
+                        "components will appear as <NOT FOUND> placeholders in AGENT_INSTRUCTIONS.md. "
+                        "Install them from Pipeline Components above, then click **Create workspace** "
+                        "again to refresh the generated files.\n\n"
+                    )
+                elif cfg.targets:
+                    preamble = "[ok] All required tools detected — workspace will be fully configured.\n\n"
+
                 _ok, message = pipe.create_workspace(cfg)
-                return gr.update(value=message, visible=True)
+                return gr.update(value=preamble + message, visible=True)
 
             create_btn.click(
                 _on_create,
-                inputs=[project_name, root_path, styles_box, strategy, targets],
+                inputs=[
+                    project_name, root_path, styles_box, strategy,
+                    targets_video_musubi, targets_image_musubi, targets_other,
+                ],
                 outputs=status_box,
             )
 
-        # ---- Section 2: pipeline guide --------------------------------
+        # ---- Section: pipeline guide --------------------------------
         with gr.Accordion("2. Pipeline guide (also written to the workspace)", open=False):
             gr.Markdown(pipe.PIPELINE_GUIDE_MD)
+
+        # ---- Handlers: refresh + per-component install --------------
+
+        # The `refresh_handler` output list needs to match across every
+        # trigger — define once and reuse.
+        refresh_outputs: list = []
+        for comp in pi.COMPONENTS:
+            r = status_rows[comp.id]
+            refresh_outputs += [r["status"], r["path"], r["button"]]
+
+        def refresh_handler(root: str):
+            install_root = Path(root) if root else Path.cwd()
+            try:
+                statuses = pi.detect_all(install_root)
+            except Exception:
+                statuses = {c.id: pi.ComponentStatus(c.id, False, None) for c in pi.COMPONENTS}
+            updates: list = []
+            for comp in pi.COMPONENTS:
+                s = statuses.get(comp.id)
+                icon, path_text, btn_text, btn_enabled = _row_display(comp, s, statuses)
+                updates.append(gr.update(value=icon))
+                updates.append(gr.update(value=path_text))
+                updates.append(gr.update(value=btn_text, interactive=btn_enabled))
+            return updates
+
+        refresh_btn.click(refresh_handler, inputs=[root_path], outputs=refresh_outputs)
+        refresh_paths_btn.click(refresh_handler, inputs=[root_path], outputs=refresh_outputs)
+
+        # Per-component Install / Update handler. Each button gets its own
+        # closure binding the component id.
+        for comp_id, row in status_rows.items():
+            def _make_install(cid: str):
+                def _handler(root: str):
+                    target_comp = pi.component_by_id(cid)
+                    if target_comp is None:
+                        yield f"[error] Unknown component: {cid}"
+                        return
+                    install_root = Path(root) if root else Path.cwd()
+                    current = pi.detect_component(target_comp, install_root)
+                    is_update = current.installed and not target_comp.always_installed
+                    log = f"# {('Updating' if is_update else 'Installing')} {target_comp.display_name}\n"
+                    log += f"# Root: {install_root}\n\n"
+                    yield log
+                    for line in pi.install_component(target_comp, install_root, update=is_update):
+                        log += line + "\n"
+                        yield log
+                return _handler
+
+            row["button"].click(
+                _make_install(comp_id),
+                inputs=[root_path],
+                outputs=install_log,
+            ).then(
+                refresh_handler,
+                inputs=[root_path],
+                outputs=refresh_outputs,
+            )
 
 
 # ----- Manifest Reviewer --------------------------------------------------
