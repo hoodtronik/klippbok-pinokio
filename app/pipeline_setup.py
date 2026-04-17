@@ -6,7 +6,7 @@ watchdog script) out of app.py so the UI file stays focused on Gradio
 wiring.
 
 Design invariants:
-  * stdlib only — no new pip deps. pathlib, os, platform, subprocess.
+  * stdlib only — no new pip deps. pathlib, os, platform, shutil, subprocess.
   * Auto-detection of companion tools fails gracefully. Missing tools get
     a `<NOT FOUND — set this path>` placeholder so the user knows to fill
     it in manually rather than crash on workspace creation.
@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import os
 import platform
+import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -265,6 +266,50 @@ def _output_subdirs(strategy: str) -> list[str]:
     return []
 
 
+def _discover_knowledge_source() -> Optional[Path]:
+    """Find the LoRA training knowledge base files, or None if unavailable.
+
+    Priority:
+      1. ``$KNOWLEDGE_BASE_DIR`` env var (user's override).
+      2. ``F:/__PROJECTS/LoRAKnowledgeBase/reviewed/`` (this machine's pattern).
+      3. ``~/LoRAKnowledgeBase/reviewed/`` (portable fallback).
+    """
+    candidates: list[Path] = []
+    if os.environ.get("KNOWLEDGE_BASE_DIR"):
+        candidates.append(Path(os.environ["KNOWLEDGE_BASE_DIR"]))
+    candidates += [
+        Path("F:/__PROJECTS/LoRAKnowledgeBase/reviewed"),
+        Path.home() / "LoRAKnowledgeBase" / "reviewed",
+    ]
+    for c in candidates:
+        if c.exists() and c.is_dir():
+            return c
+    return None
+
+
+def _copy_knowledge_files(source: Path, dest: Path) -> tuple[int, list[str]]:
+    """Copy every .md file from ``source`` into ``dest``.
+
+    Overwrites existing files in ``dest`` — the knowledge base is the
+    source of truth, and agents consult these via markdown read, not
+    via user edits. Returns ``(count, errors)``.
+
+    NOTE: files flagged "INSUFFICIENT DATA" in their content are copied
+    verbatim. The orchestration agent is expected to see the flag and
+    ask the user to fill in the gap rather than guessing. Don't filter.
+    """
+    dest.mkdir(parents=True, exist_ok=True)
+    count = 0
+    errors: list[str] = []
+    for md in source.glob("*.md"):
+        try:
+            shutil.copy2(md, dest / md.name)
+            count += 1
+        except OSError as exc:
+            errors.append(f"{md.name}: {exc}")
+    return count, errors
+
+
 def create_workspace(cfg: WorkspaceConfig) -> tuple[bool, str]:
     """Create the workspace tree and populate the three template files.
 
@@ -286,6 +331,7 @@ def create_workspace(cfg: WorkspaceConfig) -> tuple[bool, str]:
         (workspace / "configs").mkdir(parents=True, exist_ok=True)
         (workspace / "manifests").mkdir(parents=True, exist_ok=True)
         (workspace / "outputs").mkdir(parents=True, exist_ok=True)
+        (workspace / "knowledge").mkdir(parents=True, exist_ok=True)
 
         # Per-strategy outputs.
         for sub in _output_subdirs(cfg.strategy):
@@ -298,6 +344,17 @@ def create_workspace(cfg: WorkspaceConfig) -> tuple[bool, str]:
                 (workspace / "datasets" / style).mkdir(exist_ok=True)
     except OSError as exc:
         return False, f"[error] Could not create workspace directories: {exc}"
+
+    # Populate knowledge/ from the shared reviewed/ folder. Non-fatal
+    # if unavailable — the workspace still works, agent guidance is just
+    # less specific.
+    knowledge_source = _discover_knowledge_source()
+    knowledge_count = 0
+    knowledge_errors: list[str] = []
+    if knowledge_source is not None:
+        knowledge_count, knowledge_errors = _copy_knowledge_files(
+            knowledge_source, workspace / "knowledge"
+        )
 
     # Always write these; they're templates that should refresh on each run
     # so path auto-detection picks up newly-installed companions.
@@ -335,6 +392,13 @@ def create_workspace(cfg: WorkspaceConfig) -> tuple[bool, str]:
     ]
     for sub in _output_subdirs(cfg.strategy):
         lines.append(f"    {sub}/")
+    lines.append("  knowledge/   <- LoRA training knowledge base (agent reference)")
+    if knowledge_source is not None:
+        lines.append(f"    <- {knowledge_count} file(s) copied from {knowledge_source}")
+        if knowledge_errors:
+            lines.append(f"    <- {len(knowledge_errors)} error(s): " + "; ".join(knowledge_errors[:3]))
+    else:
+        lines.append("    <- source folder not found (set KNOWLEDGE_BASE_DIR to populate)")
     lines += [
         "",
         "Generated files:",
@@ -527,6 +591,24 @@ was scaffolded by the Klippbok Pinokio launcher's Agentic Pipeline tab.*
 
 ### Style subfolders under datasets/
 {styles_line}
+
+### Knowledge base
+A copy of the LoRA training knowledge base lives at `{workspace}/knowledge/`.
+Before picking training hyperparameters, read the file matching your target
+architecture (e.g. `wan22_training.md`, `flux2_klein_training.md`,
+`ltx23_training.md`, …). Each file has a confidence rating at the top
+(HIGH / MEDIUM / LOW).
+
+**If any file you need shows an `INSUFFICIENT DATA` flag — ask the user
+before guessing.** The flag is there specifically because community data
+couldn't nail the values down; the user knows their machine and their
+training intent better than you do at that point. Also consult
+`common_failures.md` when loss misbehaves and `hardware_profiles.md`
+before picking rank / blocks_to_swap.
+
+The same knowledge is also exposed via `knowledge://` MCP resources on
+`musubi-mcp` and `ltx-trainer-mcp` — use whichever surface is more
+convenient in your agent.
 
 ## Environment (auto-detected)
 
