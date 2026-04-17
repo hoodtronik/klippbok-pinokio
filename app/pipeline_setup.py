@@ -338,10 +338,28 @@ def create_workspace(cfg: WorkspaceConfig) -> tuple[bool, str]:
             (workspace / "outputs" / sub).mkdir(exist_ok=True)
 
         # Style subfolders under datasets/.
-        for style in cfg.styles:
-            style = style.strip()
-            if style:
+        # CLAUDE-NOTE: When no styles are provided, create three generic
+        # placeholder subfolders so the agent has something to work with and
+        # the user can see the expected folder convention immediately.
+        _PLACEHOLDER_STYLES = ["style_a", "style_b", "style_c"]
+        active_styles = [s.strip() for s in cfg.styles if s.strip()]
+        if active_styles:
+            for style in active_styles:
                 (workspace / "datasets" / style).mkdir(exist_ok=True)
+        else:
+            for placeholder in _PLACEHOLDER_STYLES:
+                style_dir = workspace / "datasets" / placeholder
+                style_dir.mkdir(exist_ok=True)
+                readme = style_dir / "README.md"
+                if not readme.exists():
+                    readme.write_text(
+                        "# Style Subfolder\n\n"
+                        "Replace this folder with your actual training data.\n"
+                        "Put your source clips or images here, with matching `.txt` caption files.\n"
+                        "Rename the folder to describe the visual style "
+                        "(e.g., cinematic_noir, anime_cel, photorealistic).\n",
+                        encoding="utf-8",
+                    )
     except OSError as exc:
         return False, f"[error] Could not create workspace directories: {exc}"
 
@@ -384,14 +402,30 @@ def create_workspace(cfg: WorkspaceConfig) -> tuple[bool, str]:
         statuses = pi.detect_all(Path(cfg.root_path))
     except Exception:
         statuses = {}
+
+    # CLAUDE-NOTE: Catch all exceptions here (not just OSError) so that a
+    # rendering bug in render_agent_instructions (e.g. KeyError in format
+    # substitution) doesn't silently skip all three files — directories
+    # were already created above so partial failures are confusing.
+    template_errors: list[str] = []
     try:
         (workspace / "PIPELINE_GUIDE.md").write_text(PIPELINE_GUIDE_MD, encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001
+        template_errors.append(f"PIPELINE_GUIDE.md: {exc}")
+    try:
         (workspace / "AGENT_INSTRUCTIONS.md").write_text(
             render_agent_instructions(cfg, detected, statuses=statuses), encoding="utf-8"
         )
+    except Exception as exc:  # noqa: BLE001
+        template_errors.append(f"AGENT_INSTRUCTIONS.md: {exc}")
+    try:
         (workspace / "watchdog.py").write_text(WATCHDOG_PY, encoding="utf-8")
-    except OSError as exc:
-        return False, f"[error] Could not write template files: {exc}"
+    except Exception as exc:  # noqa: BLE001
+        template_errors.append(f"watchdog.py: {exc}")
+    if template_errors:
+        return False, "[error] Could not write one or more template files:\n" + "\n".join(
+            f"  - {e}" for e in template_errors
+        )
 
     status_header = "Created new workspace" if is_new else "Refreshed existing workspace (files updated, nothing deleted)"
     lines = [
@@ -401,8 +435,10 @@ def create_workspace(cfg: WorkspaceConfig) -> tuple[bool, str]:
         "Structure:",
         "  datasets/    <- put your source clips/images here",
     ]
-    if cfg.styles:
-        lines.append("    (style subfolders: " + ", ".join(s for s in cfg.styles if s.strip()) + ")")
+    if active_styles:
+        lines.append("    (style subfolders: " + ", ".join(active_styles) + ")")
+    else:
+        lines.append("    (placeholder subfolders: style_a, style_b, style_c — rename/replace these)")
     lines += [
         "  configs/     <- training configs (created by the agent)",
         "  manifests/   <- Klippbok triage manifests",
