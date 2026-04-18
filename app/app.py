@@ -2592,25 +2592,36 @@ def _wire_project_persistence(
         _load_from_recent, inputs=recent_dropdown, outputs=load_outputs,
     )
 
-    # New Project → clear everything. (User's current state is already
-    # on disk because auto-save ran on the last edit; the gr.Warning is
-    # a reminder rather than a save-prompt.)
+    # New Project → pick a new Working directory. If the picked folder
+    # already holds a klippbok_project.json, open it instead of
+    # overwriting; otherwise set the working directory and leave every
+    # other field alone so the user's current defaults carry over. The
+    # subsequent work_dir.change fires the auto-save handler, which
+    # writes a fresh project file to the new location.
+    #
+    # CLAUDE-NOTE: An earlier version returned gr.update(value="") for
+    # every registered component; that broke Number / Checkbox /
+    # Dropdown fields (each raising on the empty string and rendering
+    # the red "Error" badge). Now we only touch work_dir + status, so
+    # non-string components are never handed a bad value.
     def _new_project() -> tuple:
-        gr.Warning(
-            "Starting a new project. Your previous project is already saved — "
-            "pick a new Working directory to begin."
+        picked = _pick_folder()
+        if not picked:
+            gr.Info("New project cancelled.")
+            return _no_change_tuple()
+        pf = ps_mod.project_file_in(picked)
+        if pf and pf.is_file():
+            gr.Info(f"Opening existing project in {picked}")
+            return _load_handler_impl(str(pf))
+        gr.Info(
+            f"New project folder: {ps_mod.project_name(picked)}. "
+            f"Auto-save is now pointed at {picked}/klippbok_project.json."
         )
-        cleared_fields = [gr.update(value="") for _ in fields]
-        return (
-            gr.update(value=""),  # work_dir
-            gr.update(value=""),  # concepts_dir
-            gr.update(value=""),  # output_dir
-            [],                   # tabs_run
-            "", "", "",           # propagation states
-            *cleared_fields,
-            gr.update(value=ps_mod.format_status("", "", [])),
-            gr.update(),          # recent dropdown untouched
-        )
+        updates = list(_no_change_tuple())
+        updates[0] = gr.update(value=picked)  # work_dir
+        updates[3] = []  # tabs_run — fresh project, no completed steps yet
+        updates[-2] = gr.update(value=ps_mod.format_status(picked, "", []))
+        return tuple(updates)
 
     new_project_btn.click(_new_project, outputs=load_outputs)
 
