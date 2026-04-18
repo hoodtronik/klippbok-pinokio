@@ -28,6 +28,7 @@ from typing import Iterator
 import gradio as gr
 
 import manifest as mft
+import project_state as ps_mod
 import pipeline_installer as pi
 import pipeline_setup as pipe
 import runner
@@ -94,6 +95,15 @@ magic — you can run the same commands in a terminal and get the same
 results. The UI exists to make the pipeline approachable and to give you
 a visual reviewer for the triage manifest (the part that would otherwise
 mean hand-editing a 1,700-line JSON file in a text editor).
+
+> **Need deeper detail?** The Klippbok authors maintain authoritative
+> docs at
+> [PIPELINES](https://github.com/alvdansen/klippbok/blob/main/docs/PIPELINES.md),
+> [CAPTIONING](https://github.com/alvdansen/klippbok/blob/main/docs/CAPTIONING.md),
+> [COMMANDS](https://github.com/alvdansen/klippbok/blob/main/docs/COMMANDS.md),
+> and the
+> [WALKTHROUGH](https://github.com/alvdansen/klippbok/blob/main/docs/WALKTHROUGH.md).
+> Reach for those when this overview isn't enough.
 
 ---
 
@@ -866,8 +876,18 @@ def _command_shell(tab_id: str, title: str, description: str, dir_label: str) ->
 
 
 def _sync(source: gr.Textbox, target: gr.Textbox) -> None:
-    """Push source's value into target whenever source changes."""
-    source.change(lambda v: v, inputs=source, outputs=target)
+    """Push source's value into target unless target already has a value.
+
+    CLAUDE-NOTE: Originally this was unconditional (overwrote target on every
+    source change), but that made per-tab directory overrides non-persistent
+    across project reloads — loading a saved project sets work_dir, which
+    fired this handler, which re-clobbered the just-loaded tab directories.
+    Now _sync only fills empty targets, so loaded/custom per-tab directories
+    survive subsequent Project-tab edits.
+    """
+    def _fill_if_empty(source_val, target_val):
+        return source_val if not target_val else target_val
+    source.change(_fill_if_empty, inputs=[source, target], outputs=target)
 
 
 # CLAUDE-NOTE: Cross-tab path propagation. Each output-producing tab pushes
@@ -947,19 +967,45 @@ def _tab_directions() -> None:
         gr.Markdown(DIRECTIONS_MD)
 
 
-def _tab_project() -> tuple[gr.Textbox, gr.Textbox, gr.Textbox]:
-    """Project tab with the three shared directory rows + a scaffold helper."""
+def _tab_project() -> dict:
+    """Project tab with the shared directory rows + scaffold + save/load UI.
+
+    Returns a dict of components because there are now several downstream
+    consumers (build_ui wires save/load, the Load Project button feeds a
+    file picker, etc.) — returning a tuple would make the call sites
+    fragile to reorder.
+    """
     with gr.Tab("Project"):
+        # CLAUDE-NOTE: Project status lives at the very top of the tab so
+        # users see which project is loaded and the last-save timestamp
+        # without scrolling. Populated by the save/load wiring in build_ui.
+        project_status = gr.Markdown(ps_mod.format_status("", "", []))
+
+        with gr.Row():
+            load_project_btn = gr.Button("Load Project", scale=0, size="sm")
+            new_project_btn = gr.Button("New Project", scale=0, size="sm")
+            recent_dropdown = gr.Dropdown(
+                label="Recent projects",
+                choices=[],
+                value=None,
+                interactive=True,
+                scale=3,
+                info="Pick a recent project directory to switch instantly.",
+            )
+
         gr.Markdown(
             "### Working directories\n"
             "Set these once — every command tab starts with the matching path"
             " as its default, and you can override per-tab as needed.\n\n"
             "**Concepts is something you populate by hand** — see the"
-            " **Directions** tab if you're not sure what that means."
+            " **Directions** tab if you're not sure what that means.\n\n"
+            "**Auto-save:** every field change is written to"
+            " `klippbok_project.json` inside your working directory. Close the"
+            " app and reopen — you'll land right back where you left off."
         )
         work_dir = _folder_row(
             "Working directory",
-            "Your raw video clips, or a dir of pre-split clips.",
+            "Your raw video clips, or a dir of pre-split clips. Also where klippbok_project.json is saved.",
         )
         concepts_dir = _folder_row(
             "Concepts directory",
@@ -1007,13 +1053,21 @@ def _tab_project() -> tuple[gr.Textbox, gr.Textbox, gr.Textbox]:
                 outputs=[scaffold_log, work_dir, concepts_dir, output_dir],
             )
 
-    return work_dir, concepts_dir, output_dir
+    return {
+        "work_dir": work_dir,
+        "concepts_dir": concepts_dir,
+        "output_dir": output_dir,
+        "project_status": project_status,
+        "load_project_btn": load_project_btn,
+        "new_project_btn": new_project_btn,
+        "recent_dropdown": recent_dropdown,
+    }
 
 
 # ----- per-command tab builders -------------------------------------------
 
 
-def _tab_scan(work_dir, _concepts, _output, _api) -> None:
+def _tab_scan(work_dir, _concepts, _output, _api, ps: "ps_mod.ProjectState") -> None:
     tab_id = "scan"
     with gr.Tab("Scan"):
         s = _command_shell(
@@ -1028,6 +1082,13 @@ def _tab_scan(work_dir, _concepts, _output, _api) -> None:
                 fps = gr.Number(label="--fps", value=16, precision=0, info="Target frame rate. Default 16 (Wan).")
                 verbose = gr.Checkbox(label="--verbose", value=False, info="Per-clip details instead of grouped summary.")
             config = gr.Textbox(label="--config (optional)", info="Path to klippbok_data.yaml.", value="")
+
+        ps.register(
+            tab_id,
+            directory=s["directory"], dry_run=s["dry_run"],
+            config=config, fps=fps, verbose=verbose,
+        )
+        ps.register_run(tab_id, s["run_btn"])
 
         def _run(directory, config, fps, verbose, dry):
             if not directory:
@@ -1048,7 +1109,7 @@ def _tab_scan(work_dir, _concepts, _output, _api) -> None:
         s["run_btn"].click(_run, inputs=[s["directory"], config, fps, verbose, s["dry_run"]], outputs=s["log"])
 
 
-def _tab_triage(work_dir, concepts_dir, _output, _api, last_manifest_state: gr.State) -> None:
+def _tab_triage(work_dir, concepts_dir, _output, _api, last_manifest_state: gr.State, ps: "ps_mod.ProjectState") -> None:
     tab_id = "triage"
     with gr.Tab("Triage"):
         s = _command_shell(
@@ -1074,6 +1135,15 @@ def _tab_triage(work_dir, concepts_dir, _output, _api, last_manifest_state: gr.S
                 organize = gr.Textbox(label="--organize DIR (optional)", info="If set, copy/move matched clips into concept-named subfolders here.", scale=3)
                 move = gr.Checkbox(label="--move", value=False, info="Move instead of copy when --organize is set.", scale=0)
             clip_model = gr.Textbox(label="--clip-model", value="openai/clip-vit-base-patch32", info="CLIP model identifier.")
+
+        ps.register(
+            "triage",
+            directory=s["directory"], dry_run=s["dry_run"],
+            concepts=concepts, threshold=threshold, frames=frames,
+            frames_per_scene=frames_per_scene, scene_threshold=scene_threshold,
+            output=output, organize=organize, move=move, clip_model=clip_model,
+        )
+        ps.register_run("triage", s["run_btn"])
 
         def _run(directory, concepts, threshold, frames, frames_per_scene, scene_threshold, output, organize, move, clip_model, dry):
             if not directory:
@@ -1138,6 +1208,7 @@ def _tab_ingest(
     _api,
     last_manifest_state: gr.State,
     last_ingest_output_state: gr.State,
+    ps: "ps_mod.ProjectState",
 ) -> None:
     tab_id = "ingest"
     with gr.Tab("Ingest"):
@@ -1167,6 +1238,14 @@ def _tab_ingest(
         # Triage just wrote; a tracker state prevents clobbering user edits.
         triage_tracker = gr.State("")
         _wire_autofill(last_manifest_state, triage, triage_tracker)
+
+        ps.register(
+            "ingest",
+            directory=s["directory"], dry_run=s["dry_run"],
+            output=output, config=config, threshold=threshold,
+            max_frames=max_frames, triage=triage, caption=caption, provider=provider,
+        )
+        ps.register_run("ingest", s["run_btn"])
 
         def _run(video, output, config, threshold, max_frames, triage, caption, provider, dry, api):
             if not video:
@@ -1220,7 +1299,7 @@ def _tab_ingest(
         )
 
 
-def _tab_normalize(work_dir, _concepts, output_dir, _api, last_ingest_output_state: gr.State) -> None:
+def _tab_normalize(work_dir, _concepts, output_dir, _api, last_ingest_output_state: gr.State, ps: "ps_mod.ProjectState") -> None:
     tab_id = "normalize"
     with gr.Tab("Normalize"):
         s = _command_shell(
@@ -1242,6 +1321,13 @@ def _tab_normalize(work_dir, _concepts, output_dir, _api, last_ingest_output_sta
                 fps = gr.Number(label="--fps", value=16, precision=0, info="Target frame rate.")
                 fmt = gr.Dropdown(label="--format", choices=["(source)", ".mp4", ".mov", ".mkv"], value="(source)", info="Force output container.")
             config = gr.Textbox(label="--config (optional)", info="Path to klippbok_data.yaml.", value="")
+
+        ps.register(
+            "normalize",
+            directory=s["directory"], dry_run=s["dry_run"],
+            output=output, fps=fps, fmt=fmt, config=config,
+        )
+        ps.register_run("normalize", s["run_btn"])
 
         def _run(directory, output, fps, fmt, config, dry):
             if not directory:
@@ -1272,6 +1358,7 @@ def _tab_caption(
     api_keys,
     last_ingest_output_state: gr.State,
     last_caption_dir_state: gr.State,
+    ps: "ps_mod.ProjectState",
 ) -> None:
     tab_id = "caption"
     with gr.Tab("Caption"):
@@ -1296,6 +1383,15 @@ def _tab_caption(
             with gr.Accordion("OpenAI-compatible / Ollama overrides", open=False):
                 base_url = gr.Textbox(label="--base-url", value="", info="e.g. http://localhost:11434/v1 for local Ollama.")
                 model = gr.Textbox(label="--model", value="", info="e.g. llama3.2-vision.")
+
+        ps.register(
+            "caption",
+            directory=s["directory"], dry_run=s["dry_run"],
+            provider=provider, use_case=use_case, anchor=anchor,
+            caption_fps=caption_fps, tags=tags, overwrite=overwrite,
+            base_url=base_url, model=model,
+        )
+        ps.register_run("caption", s["run_btn"])
 
         def _run(directory, provider, use_case, anchor, caption_fps, tags, overwrite, base_url, model, dry, api):
             if not directory:
@@ -1347,7 +1443,7 @@ def _tab_caption(
         )
 
 
-def _tab_score(work_dir, _concepts, _output, _api, last_caption_dir_state: gr.State) -> None:
+def _tab_score(work_dir, _concepts, _output, _api, last_caption_dir_state: gr.State, ps: "ps_mod.ProjectState") -> None:
     tab_id = "score"
     with gr.Tab("Score"):
         s = _command_shell(
@@ -1359,6 +1455,9 @@ def _tab_score(work_dir, _concepts, _output, _api, last_caption_dir_state: gr.St
         _sync(work_dir, s["directory"])
         dir_tracker = gr.State("")
         _wire_autofill(last_caption_dir_state, s["directory"], dir_tracker)
+
+        ps.register("score", directory=s["directory"], dry_run=s["dry_run"])
+        ps.register_run("score", s["run_btn"])
 
         def _run(directory, dry):
             if not directory:
@@ -1373,7 +1472,7 @@ def _tab_score(work_dir, _concepts, _output, _api, last_caption_dir_state: gr.St
         s["run_btn"].click(_run, inputs=[s["directory"], s["dry_run"]], outputs=s["log"])
 
 
-def _tab_extract(work_dir, _concepts, output_dir, _api, last_ingest_output_state: gr.State) -> None:
+def _tab_extract(work_dir, _concepts, output_dir, _api, last_ingest_output_state: gr.State, ps: "ps_mod.ProjectState") -> None:
     tab_id = "extract"
     with gr.Tab("Extract"):
         s = _command_shell(
@@ -1399,6 +1498,14 @@ def _tab_extract(work_dir, _concepts, output_dir, _api, last_ingest_output_state
             # CLAUDE-NOTE: --template takes a path, not a boolean. Klippbok writes
             # a template selections JSON to this path and exits without extracting.
             template = gr.Textbox(label="--template (JSON path)", info="Write a selection template to this path (no extraction). Mutually exclusive with --selections.", value="")
+
+        ps.register(
+            "extract",
+            directory=s["directory"], dry_run=s["dry_run"],
+            output=output, strategy=strategy, samples=samples,
+            overwrite=overwrite, selections=selections, template=template,
+        )
+        ps.register_run("extract", s["run_btn"])
 
         def _run(directory, output, strategy, samples, overwrite, selections, template, dry):
             if not directory:
@@ -1429,7 +1536,7 @@ def _tab_extract(work_dir, _concepts, output_dir, _api, last_ingest_output_state
         )
 
 
-def _tab_audit(work_dir, _concepts, _output, api_keys, last_caption_dir_state: gr.State) -> None:
+def _tab_audit(work_dir, _concepts, _output, api_keys, last_caption_dir_state: gr.State, ps: "ps_mod.ProjectState") -> None:
     tab_id = "audit"
     with gr.Tab("Audit"):
         s = _command_shell(
@@ -1446,6 +1553,13 @@ def _tab_audit(work_dir, _concepts, _output, api_keys, last_caption_dir_state: g
                 provider = gr.Dropdown(label="--provider", choices=["gemini", "replicate", "openai"], value="gemini")
                 use_case = gr.Dropdown(label="--use-case", choices=["(auto)", "character", "style", "motion", "object"], value="(auto)")
                 mode = gr.Dropdown(label="--mode", choices=["report_only", "save_audit"], value="report_only")
+
+        ps.register(
+            "audit",
+            directory=s["directory"], dry_run=s["dry_run"],
+            provider=provider, use_case=use_case, mode=mode,
+        )
+        ps.register_run("audit", s["run_btn"])
 
         def _run(directory, provider, use_case, mode, dry, api):
             if not directory:
@@ -1470,7 +1584,7 @@ def _tab_audit(work_dir, _concepts, _output, api_keys, last_caption_dir_state: g
         )
 
 
-def _tab_validate(work_dir, _concepts, _output, _api, last_ingest_output_state: gr.State) -> None:
+def _tab_validate(work_dir, _concepts, _output, _api, last_ingest_output_state: gr.State, ps: "ps_mod.ProjectState") -> None:
     tab_id = "validate"
     with gr.Tab("Validate"):
         s = _command_shell(
@@ -1491,6 +1605,14 @@ def _tab_validate(work_dir, _concepts, _output, _api, last_ingest_output_state: 
                 duplicates = gr.Checkbox(label="--duplicates", value=False, info="Perceptual duplicate detection.")
                 json_out = gr.Checkbox(label="--json", value=False, info="Emit JSON instead of formatted report.")
             config = gr.Textbox(label="--config (optional)", info="Path to klippbok_data.yaml override.", value="")
+
+        ps.register(
+            "validate",
+            directory=s["directory"], dry_run=s["dry_run"],
+            manifest=manifest, buckets=buckets, quality=quality,
+            duplicates=duplicates, json_out=json_out, config=config,
+        )
+        ps.register_run("validate", s["run_btn"])
 
         def _run(path, manifest, buckets, quality, duplicates, json_out, config, dry):
             if not path:
@@ -1521,7 +1643,7 @@ def _tab_validate(work_dir, _concepts, _output, _api, last_ingest_output_state: 
         )
 
 
-def _tab_organize(work_dir, _concepts, output_dir, _api) -> None:
+def _tab_organize(work_dir, _concepts, output_dir, _api, ps: "ps_mod.ProjectState") -> None:
     tab_id = "organize"
     with gr.Tab("Organize"):
         s = _command_shell(
@@ -1561,6 +1683,15 @@ def _tab_organize(work_dir, _concepts, output_dir, _api) -> None:
                 move = gr.Checkbox(label="--move", value=False, info="Move instead of copy (destructive).")
                 manifest = gr.Checkbox(label="--manifest", value=False, info="Write klippbok_manifest.json to the output.")
             config = gr.Textbox(label="--config (optional)", info="Path to klippbok_data.yaml.", value="")
+
+        ps.register(
+            "organize",
+            directory=s["directory"], dry_run=s["dry_run"],
+            output=output, layout=layout, trainers=trainers,
+            concepts=concepts, klippbok_dry_run=klippbok_dry_run,
+            strict=strict, move=move, manifest=manifest, config=config,
+        )
+        ps.register_run("organize", s["run_btn"])
 
         def _run(path, output, layout, trainers, concepts, kb_dry, strict, move, manifest, config, dry):
             if not path:
@@ -2056,7 +2187,7 @@ def _render_page(state: dict) -> list:
     return out
 
 
-def _tab_manifest_reviewer(last_manifest_state: gr.State, work_dir: gr.Textbox) -> None:
+def _tab_manifest_reviewer(last_manifest_state: gr.State, work_dir: gr.Textbox, ps: "ps_mod.ProjectState") -> None:
     with gr.Tab("Manifest Reviewer"):
         gr.Markdown(
             "### Manifest Reviewer\n"
@@ -2091,6 +2222,11 @@ def _tab_manifest_reviewer(last_manifest_state: gr.State, work_dir: gr.Textbox) 
         # refreshes the field (refilling from "" or our own prior value).
         reviewer_tracker = gr.State("")
         _wire_autofill(last_manifest_state, path_in, reviewer_tracker)
+
+        # CLAUDE-NOTE: Only path_in gets persisted — per-clip include flags
+        # and pagination state are intentionally excluded (they're large
+        # and tied to a manifest file that users re-load each session).
+        ps.register("manifest_reviewer", path=path_in)
 
         # Explicit button for the "I restarted the UI, find the latest from disk"
         # case, which scans the Project tab's working directory too.
@@ -2282,6 +2418,230 @@ def _tab_manifest_reviewer(last_manifest_state: gr.State, work_dir: gr.Textbox) 
 # ----- ui ------------------------------------------------------------------
 
 
+def _wire_project_persistence(
+    *,
+    demo: gr.Blocks,
+    ps: "ps_mod.ProjectState",
+    work_dir: gr.Textbox,
+    concepts_dir: gr.Textbox,
+    output_dir: gr.Textbox,
+    tabs_run_state: gr.State,
+    last_manifest_state: gr.State,
+    last_ingest_output_state: gr.State,
+    last_caption_dir_state: gr.State,
+    project_status: gr.Markdown,
+    recent_dropdown: gr.Dropdown,
+    load_project_btn: gr.Button,
+    new_project_btn: gr.Button,
+) -> None:
+    """Install auto-save, auto-load, and project-management wiring.
+
+    Call exactly once, after every tab has registered its components
+    with `ps`. This single function owns the contract between producer
+    tabs (which push new values into the registered components) and the
+    on-disk `klippbok_project.json` file.
+    """
+    fields = ps.ordered_components()
+
+    # Order matters — every save handler reads these in this order, and
+    # every load handler writes in this same order. Keep the two lists
+    # structurally identical (except fields get gr.update(...), states
+    # get raw values, and the UI meta goes in the tail).
+    _state_inputs = [
+        work_dir, concepts_dir, output_dir, tabs_run_state,
+        last_manifest_state, last_ingest_output_state, last_caption_dir_state,
+    ]
+    save_inputs = _state_inputs + list(fields)
+    load_outputs = _state_inputs + list(fields) + [project_status, recent_dropdown]
+    _load_tail_size = 2  # project_status + recent_dropdown
+
+    def _save_handler(wd, cd, od, tabs_run,
+                      last_triage_m, last_ingest_o, last_caption_d,
+                      *field_values):
+        # No work_dir = no save target; show the empty status and leave
+        # the dropdown untouched.
+        if not wd:
+            return (
+                gr.update(value=ps_mod.format_status("", "", [])),
+                gr.update(),
+            )
+        propagation = {
+            "last_triage_manifest": last_triage_m or "",
+            "last_ingest_output": last_ingest_o or "",
+            "last_caption_dir": last_caption_d or "",
+        }
+        payload = ps_mod.build_payload(
+            wd, cd, od, tabs_run or [], propagation,
+            ps.pack_values(list(field_values)),
+        )
+        saved_at, err = ps_mod.save_project(wd, payload)
+        status = ps_mod.format_status(wd, saved_at, tabs_run or [], err)
+        return (
+            gr.update(value=status),
+            gr.update(choices=ps_mod.load_recent(), value=None),
+        )
+
+    # Trigger save on every registered field + shared dirs + state changes.
+    # gr.on bundles multiple triggers onto the same handler, so the 60+
+    # events share one save function instead of 60 individual wirings.
+    save_triggers = [f.change for f in fields]
+    save_triggers += [
+        work_dir.change, concepts_dir.change, output_dir.change,
+        tabs_run_state.change,
+        last_manifest_state.change,
+        last_ingest_output_state.change,
+        last_caption_dir_state.change,
+    ]
+    gr.on(
+        save_triggers, _save_handler,
+        inputs=save_inputs,
+        outputs=[project_status, recent_dropdown],
+    )
+
+    # Run-button click → mark tab as completed. A second .click() handler
+    # on the same button runs alongside the tab's existing _run streamer.
+    def _make_mark_ran(tab_id: str):
+        def _mark(tabs_run):
+            tabs_run = list(tabs_run or [])
+            if tab_id not in tabs_run:
+                tabs_run.append(tab_id)
+            return tabs_run
+        return _mark
+
+    for tab_id, btn in ps.run_buttons().items():
+        btn.click(
+            _make_mark_ran(tab_id),
+            inputs=tabs_run_state,
+            outputs=tabs_run_state,
+        )
+
+    # ----- LOAD pipeline ---------------------------------------------------
+
+    def _no_change_tuple() -> tuple:
+        # Used when a load attempt fails — every output stays put.
+        return tuple(gr.update() for _ in load_outputs)
+
+    def _load_handler_impl(path: str) -> tuple:
+        payload, err = ps_mod.read_project_file(path)
+        if err or payload is None:
+            gr.Warning(f"Could not load project: {err}")
+            return _no_change_tuple()
+        wd, cd, od = ps_mod.extract_project_dirs(payload)
+        tabs_run = ps_mod.extract_tabs_run(payload)
+        paths = ps_mod.extract_paths(payload)
+        field_updates = ps.unpack_values(ps_mod.extract_fields(payload))
+        saved_at = payload.get("saved_at", "")
+        status = ps_mod.format_status(wd, saved_at, tabs_run)
+        # Record this open so it shows up in Recent Projects next time.
+        if wd:
+            try:
+                ps_mod._update_recent(wd)
+            except Exception:
+                pass
+        gr.Info(f"Loaded project: {ps_mod.project_name(wd) or wd}")
+        return (
+            gr.update(value=wd),
+            gr.update(value=cd),
+            gr.update(value=od),
+            tabs_run,
+            paths.get("last_triage_manifest", ""),
+            paths.get("last_ingest_output", ""),
+            paths.get("last_caption_dir", ""),
+            *field_updates,
+            gr.update(value=status),
+            gr.update(choices=ps_mod.load_recent(), value=None),
+        )
+
+    # File-picker bridge: button → filedialog → path state → load handler.
+    def _pick_project_file() -> str:
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            p = filedialog.askopenfilename(
+                title="Select klippbok_project.json",
+                filetypes=[("Klippbok project", "klippbok_project.json"),
+                           ("JSON", "*.json"),
+                           ("All files", "*.*")],
+            )
+            root.destroy()
+            return p or ""
+        except Exception:
+            return ""
+
+    picker_path_state = gr.State("")
+    load_project_btn.click(
+        _pick_project_file, outputs=picker_path_state,
+    ).then(
+        _load_handler_impl, inputs=picker_path_state, outputs=load_outputs,
+    )
+
+    # Recent Projects dropdown → load matching klippbok_project.json.
+    def _load_from_recent(chosen_dir: str) -> tuple:
+        if not chosen_dir:
+            return _no_change_tuple()
+        pf = ps_mod.project_file_in(chosen_dir)
+        if not pf or not pf.is_file():
+            gr.Warning(f"No klippbok_project.json found in: {chosen_dir}")
+            return _no_change_tuple()
+        return _load_handler_impl(str(pf))
+
+    recent_dropdown.change(
+        _load_from_recent, inputs=recent_dropdown, outputs=load_outputs,
+    )
+
+    # New Project → clear everything. (User's current state is already
+    # on disk because auto-save ran on the last edit; the gr.Warning is
+    # a reminder rather than a save-prompt.)
+    def _new_project() -> tuple:
+        gr.Warning(
+            "Starting a new project. Your previous project is already saved — "
+            "pick a new Working directory to begin."
+        )
+        cleared_fields = [gr.update(value="") for _ in fields]
+        return (
+            gr.update(value=""),  # work_dir
+            gr.update(value=""),  # concepts_dir
+            gr.update(value=""),  # output_dir
+            [],                   # tabs_run
+            "", "", "",           # propagation states
+            *cleared_fields,
+            gr.update(value=ps_mod.format_status("", "", [])),
+            gr.update(),          # recent dropdown untouched
+        )
+
+    new_project_btn.click(_new_project, outputs=load_outputs)
+
+    # Startup auto-load: prefer the last project file; fall back to
+    # per-user detected_paths if no project file exists (so the
+    # cross-tab propagation feature still has sane defaults).
+    def _initial_load() -> tuple:
+        last = ps_mod.load_last_project_dir()
+        if last:
+            pf = ps_mod.project_file_in(last)
+            if pf and pf.is_file():
+                return _load_handler_impl(str(pf))
+        # Fallback path: no project file → only fill propagation states
+        # from detected_paths; leave every field untouched.
+        dp = _load_detected_paths()
+        updates = list(_no_change_tuple())
+        updates[4] = dp.get(_DETECTED_KEY_TRIAGE_MANIFEST, "")
+        updates[5] = dp.get(_DETECTED_KEY_INGEST_OUTPUT, "")
+        updates[6] = dp.get(_DETECTED_KEY_CAPTION_DIR, "")
+        # Tail: status + dropdown choices.
+        updates[-2] = gr.update(value=ps_mod.format_status("", "", []))
+        updates[-1] = gr.update(choices=ps_mod.load_recent(), value=None)
+        return tuple(updates)
+
+    demo.load(_initial_load, outputs=load_outputs)
+
+    # Ensure _load_tail_size matches expectations (compile-time sanity
+    # check — kept explicit so future edits notice if they drift).
+    assert _load_tail_size == 2, "load_outputs tail size mismatch"
+
+
 def build_ui() -> gr.Blocks:
     with gr.Blocks(title="Klippbok", analytics_enabled=False) as demo:
         gr.Markdown("# Klippbok\n_Video dataset curation — Pinokio launcher_")
@@ -2305,50 +2665,44 @@ def build_ui() -> gr.Blocks:
         last_ingest_output_state = gr.State("")
         last_caption_dir_state = gr.State("")
 
+        # CLAUDE-NOTE: Per-session registry + tabs-run tracker for
+        # project-level persistence. `ps` is populated as each tab builds
+        # (ps.register / ps.register_run); the wiring pass at the end of
+        # build_ui installs a save handler on every registered component.
+        ps = ps_mod.ProjectState()
+        tabs_run_state = gr.State([])
+
         # Landing / orientation.
         _tab_directions()
 
-        # Shared directory state + scaffold helper.
-        work_dir, concepts_dir, output_dir = _tab_project()
+        # Shared directory state + scaffold helper + Load/New/Recent UI.
+        project_ui = _tab_project()
+        work_dir = project_ui["work_dir"]
+        concepts_dir = project_ui["concepts_dir"]
+        output_dir = project_ui["output_dir"]
 
         # The Klippbok command tabs, in pipeline order. Each tab receives
-        # only the propagation states it produces or consumes.
-        _tab_scan(work_dir, concepts_dir, output_dir, api_state)
-        _tab_triage(work_dir, concepts_dir, output_dir, api_state, last_manifest_state)
+        # only the propagation states it produces or consumes; `ps` is
+        # always last so registrations happen during tab construction.
+        _tab_scan(work_dir, concepts_dir, output_dir, api_state, ps)
+        _tab_triage(work_dir, concepts_dir, output_dir, api_state, last_manifest_state, ps)
         _tab_ingest(
             work_dir, concepts_dir, output_dir, api_state,
-            last_manifest_state, last_ingest_output_state,
+            last_manifest_state, last_ingest_output_state, ps,
         )
-        _tab_normalize(work_dir, concepts_dir, output_dir, api_state, last_ingest_output_state)
+        _tab_normalize(work_dir, concepts_dir, output_dir, api_state, last_ingest_output_state, ps)
         _tab_caption(
             work_dir, concepts_dir, output_dir, api_state,
-            last_ingest_output_state, last_caption_dir_state,
+            last_ingest_output_state, last_caption_dir_state, ps,
         )
-        _tab_score(work_dir, concepts_dir, output_dir, api_state, last_caption_dir_state)
-        _tab_extract(work_dir, concepts_dir, output_dir, api_state, last_ingest_output_state)
-        _tab_audit(work_dir, concepts_dir, output_dir, api_state, last_caption_dir_state)
-        _tab_validate(work_dir, concepts_dir, output_dir, api_state, last_ingest_output_state)
-        _tab_organize(work_dir, concepts_dir, output_dir, api_state)
+        _tab_score(work_dir, concepts_dir, output_dir, api_state, last_caption_dir_state, ps)
+        _tab_extract(work_dir, concepts_dir, output_dir, api_state, last_ingest_output_state, ps)
+        _tab_audit(work_dir, concepts_dir, output_dir, api_state, last_caption_dir_state, ps)
+        _tab_validate(work_dir, concepts_dir, output_dir, api_state, last_ingest_output_state, ps)
+        _tab_organize(work_dir, concepts_dir, output_dir, api_state, ps)
 
         # Manifest Reviewer — the whole reason this launcher exists.
-        _tab_manifest_reviewer(last_manifest_state, work_dir)
-
-        # CLAUDE-NOTE: Hydrate propagation states from disk AFTER every tab
-        # has wired its .change() handler. demo.load() returning a new
-        # state value fires those handlers, so the consumer fields fill in
-        # on first render (tracker stays at "" initially, so the first
-        # autofill writes to empty fields as expected).
-        def _hydrate_propagation_states():
-            dp = _load_detected_paths()
-            return (
-                dp.get(_DETECTED_KEY_TRIAGE_MANIFEST, ""),
-                dp.get(_DETECTED_KEY_INGEST_OUTPUT, ""),
-                dp.get(_DETECTED_KEY_CAPTION_DIR, ""),
-            )
-        demo.load(
-            _hydrate_propagation_states,
-            outputs=[last_manifest_state, last_ingest_output_state, last_caption_dir_state],
-        )
+        _tab_manifest_reviewer(last_manifest_state, work_dir, ps)
 
         # API keys, install-check, python-exe override (polished in step 7).
         _tab_settings(api_state)
@@ -2357,6 +2711,26 @@ def build_ui() -> gr.Blocks:
         # Musubi/LTX trainers via MCP). Scaffolds a workspace + docs; does
         # NOT do any training itself. Pipeline designed by hoodtronik.
         _tab_agentic_pipeline()
+
+        # CLAUDE-NOTE: Install the project-persistence pipeline AFTER every
+        # tab has registered its components. This wires auto-save on every
+        # registered field + the project-management buttons + the
+        # demo.load hook that auto-loads the last project on startup.
+        _wire_project_persistence(
+            demo=demo,
+            ps=ps,
+            work_dir=work_dir,
+            concepts_dir=concepts_dir,
+            output_dir=output_dir,
+            tabs_run_state=tabs_run_state,
+            last_manifest_state=last_manifest_state,
+            last_ingest_output_state=last_ingest_output_state,
+            last_caption_dir_state=last_caption_dir_state,
+            project_status=project_ui["project_status"],
+            recent_dropdown=project_ui["recent_dropdown"],
+            load_project_btn=project_ui["load_project_btn"],
+            new_project_btn=project_ui["new_project_btn"],
+        )
 
     return demo
 
