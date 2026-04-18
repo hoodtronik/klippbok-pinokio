@@ -12,6 +12,9 @@
 //   7. Fallback         -> CPU wheel
 //
 // Versions are pinned so triage results are reproducible. Upgrade deliberately.
+// CLAUDE-NOTE: 2026-04-18 — bumped torch 2.4.1 -> 2.6.0 (torchvision 0.19.1 ->
+// 0.21.0) to close CVE-2025-32434 in torch.load weights-only path. Intel Mac
+// branch stays at 2.2.2 because 2.6 has no Intel Mac wheels.
 module.exports = {
   run: [
     // nvidia windows
@@ -21,7 +24,7 @@ module.exports = {
       params: {
         venv: "{{args && args.venv ? args.venv : null}}",
         path: "{{args && args.path ? args.path : '.'}}",
-        message: "uv pip install torch==2.4.1 torchvision==0.19.1 --index-url https://download.pytorch.org/whl/cu124 --force-reinstall --no-deps"
+        message: "uv pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124 --force-reinstall --no-deps"
       },
       next: null
     },
@@ -32,7 +35,7 @@ module.exports = {
       params: {
         venv: "{{args && args.venv ? args.venv : null}}",
         path: "{{args && args.path ? args.path : '.'}}",
-        message: "uv pip install torch==2.4.1 torchvision==0.19.1 --index-url https://download.pytorch.org/whl/cu124 --force-reinstall"
+        message: "uv pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124 --force-reinstall"
       },
       next: null
     },
@@ -54,7 +57,7 @@ module.exports = {
       params: {
         venv: "{{args && args.venv ? args.venv : null}}",
         path: "{{args && args.path ? args.path : '.'}}",
-        message: "uv pip install torch==2.4.1 torchvision==0.19.1 --index-url https://download.pytorch.org/whl/rocm6.1 --force-reinstall --no-deps"
+        message: "uv pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/rocm6.1 --force-reinstall --no-deps"
       },
       next: null
     },
@@ -65,7 +68,7 @@ module.exports = {
       params: {
         venv: "{{args && args.venv ? args.venv : null}}",
         path: "{{args && args.path ? args.path : '.'}}",
-        message: "uv pip install torch==2.4.1 torchvision==0.19.1 --index-url https://download.pytorch.org/whl/cpu --force-reinstall --no-deps"
+        message: "uv pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cpu --force-reinstall --no-deps"
       },
       next: null
     },
@@ -86,7 +89,7 @@ module.exports = {
       params: {
         venv: "{{args && args.venv ? args.venv : null}}",
         path: "{{args && args.path ? args.path : '.'}}",
-        message: "uv pip install torch==2.4.1 torchvision==0.19.1 --index-url https://download.pytorch.org/whl/cpu --force-reinstall --no-deps"
+        message: "uv pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cpu --force-reinstall --no-deps"
       }
     }
   ]
