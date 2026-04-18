@@ -870,6 +870,59 @@ def _sync(source: gr.Textbox, target: gr.Textbox) -> None:
     source.change(lambda v: v, inputs=source, outputs=target)
 
 
+# CLAUDE-NOTE: Cross-tab path propagation. Each output-producing tab pushes
+# its newly-written path into a gr.State; consumer tabs wire a .change()
+# handler on that state to fill their own input field unless the user has
+# already typed something different. Persistence lives in
+# .user_settings.json[detected_paths] (via pipeline_installer), so values
+# survive app restarts. Keys kept here so producer + consumer sides agree.
+_DETECTED_KEY_TRIAGE_MANIFEST = "last_triage_manifest"
+_DETECTED_KEY_INGEST_OUTPUT = "last_ingest_output"
+_DETECTED_KEY_CAPTION_DIR = "last_caption_dir"
+
+
+def _autofill_handler(new_value: str, current: str, last_auto: str) -> tuple:
+    """Propagate new_value into a field unless the user has edited it.
+
+    Returns (gr.update_for_field, new_tracker_value). Fills only when the
+    field is empty or still holds our prior auto-fill — manual edits are
+    preserved forever (the tracker stays pinned to the old auto-fill, so
+    current != last_auto stays true on subsequent state changes).
+    """
+    if not new_value:
+        return gr.update(), last_auto
+    if current and current != last_auto:
+        return gr.update(), last_auto
+    return gr.update(value=new_value), new_value
+
+
+def _wire_autofill(source_state: gr.State, target: gr.Textbox, tracker: gr.State) -> None:
+    """Wire source_state.change() to propagate into target via tracker."""
+    source_state.change(
+        _autofill_handler,
+        inputs=[source_state, target, tracker],
+        outputs=[target, tracker],
+    )
+
+
+def _persist_detected(key: str, value: str) -> None:
+    """Best-effort merge of a single detected_paths entry."""
+    if not value:
+        return
+    try:
+        pi.update_detected_path(key, value)
+    except Exception:
+        pass  # UI keeps working even if disk is read-only.
+
+
+def _load_detected_paths() -> dict:
+    """Best-effort read of detected_paths from .user_settings.json."""
+    try:
+        return pi.load_user_settings().get("detected_paths", {}) or {}
+    except Exception:
+        return {}
+
+
 def _base_cmd(*parts: str) -> list[str]:
     return [runner.python_executable(), "-m", *parts]
 
@@ -1052,13 +1105,20 @@ def _tab_triage(work_dir, concepts_dir, _output, _api, last_manifest_state: gr.S
                 return
             yield from _stream(tab_id, cmd)
 
-        def _after_run(directory: str, output_override: str, dry: bool, current: str) -> str:
+        def _after_run(directory: str, output_override: str, dry: bool, current: str, log: str):
             # CLAUDE-NOTE: Don't update state on dry runs — Klippbok wasn't
             # actually invoked so nothing was written. Keep whatever was there.
             if dry:
-                return current
+                return current, log
             detected = _detect_triage_manifest(directory, output_override)
-            return detected or current
+            if not detected:
+                return current, log
+            _persist_detected(_DETECTED_KEY_TRIAGE_MANIFEST, detected)
+            notice = (
+                f"\n[propagated] Manifest saved to {detected} — "
+                f"auto-loaded into Ingest and Manifest Reviewer tabs."
+            )
+            return detected, (log or "") + notice
 
         s["run_btn"].click(
             _run,
@@ -1066,12 +1126,19 @@ def _tab_triage(work_dir, concepts_dir, _output, _api, last_manifest_state: gr.S
             outputs=s["log"],
         ).then(
             _after_run,
-            inputs=[s["directory"], output, s["dry_run"], last_manifest_state],
-            outputs=last_manifest_state,
+            inputs=[s["directory"], output, s["dry_run"], last_manifest_state, s["log"]],
+            outputs=[last_manifest_state, s["log"]],
         )
 
 
-def _tab_ingest(work_dir, _concepts, output_dir, _api) -> None:
+def _tab_ingest(
+    work_dir,
+    _concepts,
+    output_dir,
+    _api,
+    last_manifest_state: gr.State,
+    last_ingest_output_state: gr.State,
+) -> None:
     tab_id = "ingest"
     with gr.Tab("Ingest"):
         s = _command_shell(
@@ -1095,6 +1162,11 @@ def _tab_ingest(work_dir, _concepts, output_dir, _api) -> None:
             with gr.Row():
                 caption = gr.Checkbox(label="--caption", value=False, info="Auto-caption each clip after splitting.", scale=0)
                 provider = gr.Dropdown(label="--provider (if --caption)", choices=["gemini", "replicate", "openai"], value="gemini", scale=0)
+
+        # CLAUDE-NOTE: Cross-tab auto-fill. `--triage` picks up the manifest
+        # Triage just wrote; a tracker state prevents clobbering user edits.
+        triage_tracker = gr.State("")
+        _wire_autofill(last_manifest_state, triage, triage_tracker)
 
         def _run(video, output, config, threshold, max_frames, triage, caption, provider, dry, api):
             if not video:
@@ -1121,14 +1193,34 @@ def _tab_ingest(work_dir, _concepts, output_dir, _api) -> None:
                 return
             yield from _stream(tab_id, cmd, extra_env=api)
 
+        def _after_run(output_val: str, dry: bool, current: str, log: str):
+            # CLAUDE-NOTE: Publish --output to last_ingest_output_state so
+            # Normalize/Caption/Extract/Validate auto-fill their directory.
+            # Skip dry runs (no write actually happened). We don't inspect
+            # the log for success markers — treating any non-dry run as a
+            # write is accurate enough, and matches how Triage's _after_run
+            # behaves (it just checks disk for the manifest file).
+            if dry or not output_val:
+                return current, log
+            _persist_detected(_DETECTED_KEY_INGEST_OUTPUT, output_val)
+            notice = (
+                f"\n[propagated] Clips written to {output_val} — "
+                f"auto-loaded into Normalize, Caption, Extract, and Validate tabs."
+            )
+            return output_val, (log or "") + notice
+
         s["run_btn"].click(
             _run,
             inputs=[s["directory"], output, config, threshold, max_frames, triage, caption, provider, s["dry_run"], _api],
             outputs=s["log"],
+        ).then(
+            _after_run,
+            inputs=[output, s["dry_run"], last_ingest_output_state, s["log"]],
+            outputs=[last_ingest_output_state, s["log"]],
         )
 
 
-def _tab_normalize(work_dir, _concepts, output_dir, _api) -> None:
+def _tab_normalize(work_dir, _concepts, output_dir, _api, last_ingest_output_state: gr.State) -> None:
     tab_id = "normalize"
     with gr.Tab("Normalize"):
         s = _command_shell(
@@ -1138,6 +1230,8 @@ def _tab_normalize(work_dir, _concepts, output_dir, _api) -> None:
             "Directory (positional) — clips to normalize",
         )
         _sync(work_dir, s["directory"])
+        dir_tracker = gr.State("")
+        _wire_autofill(last_ingest_output_state, s["directory"], dir_tracker)
         with s["options"]:
             with gr.Row():
                 output = gr.Textbox(label="--output (required)", info="Where normalized clips go.", scale=3)
@@ -1171,7 +1265,14 @@ def _tab_normalize(work_dir, _concepts, output_dir, _api) -> None:
         s["run_btn"].click(_run, inputs=[s["directory"], output, fps, fmt, config, s["dry_run"]], outputs=s["log"])
 
 
-def _tab_caption(work_dir, _concepts, _output, api_keys) -> None:
+def _tab_caption(
+    work_dir,
+    _concepts,
+    _output,
+    api_keys,
+    last_ingest_output_state: gr.State,
+    last_caption_dir_state: gr.State,
+) -> None:
     tab_id = "caption"
     with gr.Tab("Caption"):
         s = _command_shell(
@@ -1181,6 +1282,8 @@ def _tab_caption(work_dir, _concepts, _output, api_keys) -> None:
             "Directory (positional) — clips to caption",
         )
         _sync(work_dir, s["directory"])
+        dir_tracker = gr.State("")
+        _wire_autofill(last_ingest_output_state, s["directory"], dir_tracker)
         with s["options"]:
             with gr.Row():
                 provider = gr.Dropdown(label="--provider", choices=["gemini", "replicate", "openai"], value="gemini", info="VLM backend.")
@@ -1220,14 +1323,31 @@ def _tab_caption(work_dir, _concepts, _output, api_keys) -> None:
                 return
             yield from _stream(tab_id, cmd, extra_env=api)
 
+        def _after_run(directory: str, dry: bool, current: str, log: str):
+            # CLAUDE-NOTE: Caption writes .txt sidecars in-place, so the
+            # "caption output" downstream consumers want IS the input
+            # directory. Publishing that here lets Score/Audit auto-fill.
+            if dry or not directory:
+                return current, log
+            _persist_detected(_DETECTED_KEY_CAPTION_DIR, directory)
+            notice = (
+                f"\n[propagated] Captions written in {directory} — "
+                f"auto-loaded into Score and Audit tabs."
+            )
+            return directory, (log or "") + notice
+
         s["run_btn"].click(
             _run,
             inputs=[s["directory"], provider, use_case, anchor, caption_fps, tags, overwrite, base_url, model, s["dry_run"], api_keys],
             outputs=s["log"],
+        ).then(
+            _after_run,
+            inputs=[s["directory"], s["dry_run"], last_caption_dir_state, s["log"]],
+            outputs=[last_caption_dir_state, s["log"]],
         )
 
 
-def _tab_score(work_dir, _concepts, _output, _api) -> None:
+def _tab_score(work_dir, _concepts, _output, _api, last_caption_dir_state: gr.State) -> None:
     tab_id = "score"
     with gr.Tab("Score"):
         s = _command_shell(
@@ -1237,6 +1357,8 @@ def _tab_score(work_dir, _concepts, _output, _api) -> None:
             "Directory (positional) — caption .txt files",
         )
         _sync(work_dir, s["directory"])
+        dir_tracker = gr.State("")
+        _wire_autofill(last_caption_dir_state, s["directory"], dir_tracker)
 
         def _run(directory, dry):
             if not directory:
@@ -1251,7 +1373,7 @@ def _tab_score(work_dir, _concepts, _output, _api) -> None:
         s["run_btn"].click(_run, inputs=[s["directory"], s["dry_run"]], outputs=s["log"])
 
 
-def _tab_extract(work_dir, _concepts, output_dir, _api) -> None:
+def _tab_extract(work_dir, _concepts, output_dir, _api, last_ingest_output_state: gr.State) -> None:
     tab_id = "extract"
     with gr.Tab("Extract"):
         s = _command_shell(
@@ -1261,6 +1383,8 @@ def _tab_extract(work_dir, _concepts, output_dir, _api) -> None:
             "Directory (positional) — clips or images",
         )
         _sync(work_dir, s["directory"])
+        dir_tracker = gr.State("")
+        _wire_autofill(last_ingest_output_state, s["directory"], dir_tracker)
         with s["options"]:
             with gr.Row():
                 output = gr.Textbox(label="--output", info="Where PNG references are written.", scale=3)
@@ -1305,7 +1429,7 @@ def _tab_extract(work_dir, _concepts, output_dir, _api) -> None:
         )
 
 
-def _tab_audit(work_dir, _concepts, _output, api_keys) -> None:
+def _tab_audit(work_dir, _concepts, _output, api_keys, last_caption_dir_state: gr.State) -> None:
     tab_id = "audit"
     with gr.Tab("Audit"):
         s = _command_shell(
@@ -1315,6 +1439,8 @@ def _tab_audit(work_dir, _concepts, _output, api_keys) -> None:
             "Directory (positional) — captioned clips",
         )
         _sync(work_dir, s["directory"])
+        dir_tracker = gr.State("")
+        _wire_autofill(last_caption_dir_state, s["directory"], dir_tracker)
         with s["options"]:
             with gr.Row():
                 provider = gr.Dropdown(label="--provider", choices=["gemini", "replicate", "openai"], value="gemini")
@@ -1344,7 +1470,7 @@ def _tab_audit(work_dir, _concepts, _output, api_keys) -> None:
         )
 
 
-def _tab_validate(work_dir, _concepts, _output, _api) -> None:
+def _tab_validate(work_dir, _concepts, _output, _api, last_ingest_output_state: gr.State) -> None:
     tab_id = "validate"
     with gr.Tab("Validate"):
         s = _command_shell(
@@ -1354,6 +1480,8 @@ def _tab_validate(work_dir, _concepts, _output, _api) -> None:
             "Path (positional) — dataset folder or klippbok_data.yaml",
         )
         _sync(work_dir, s["directory"])
+        dir_tracker = gr.State("")
+        _wire_autofill(last_ingest_output_state, s["directory"], dir_tracker)
         with s["options"]:
             with gr.Row():
                 manifest = gr.Checkbox(label="--manifest", value=False, info="Write klippbok_manifest.json to the dataset folder.")
@@ -1957,16 +2085,12 @@ def _tab_manifest_reviewer(last_manifest_state: gr.State, work_dir: gr.Textbox) 
             use_latest_btn = gr.Button("Use latest triage output", scale=0, size="sm")
             load_btn = gr.Button("Load", variant="primary", scale=0)
 
-        # CLAUDE-NOTE: When Triage finishes it pushes the written manifest path
-        # into last_manifest_state. Auto-fill path_in only if the user hasn't
-        # typed anything — don't clobber their in-progress work.
-        def _on_triage_output(latest: str, current: str) -> str:
-            if current:
-                return current
-            return latest or ""
-        last_manifest_state.change(
-            _on_triage_output, inputs=[last_manifest_state, path_in], outputs=path_in
-        )
+        # CLAUDE-NOTE: Triage pushes the written manifest path into
+        # last_manifest_state; _wire_autofill tracks what we last auto-set
+        # so the user's manual edits survive, but rerunning Triage still
+        # refreshes the field (refilling from "" or our own prior value).
+        reviewer_tracker = gr.State("")
+        _wire_autofill(last_manifest_state, path_in, reviewer_tracker)
 
         # Explicit button for the "I restarted the UI, find the latest from disk"
         # case, which scans the Project tab's working directory too.
@@ -2171,9 +2295,15 @@ def build_ui() -> gr.Blocks:
         api_state = gr.State(
             {k: v for k, v in _persisted.items() if k in _RELEVANT_ENV_KEYS and v}
         )
-        # Populated by the Triage tab on successful run; consumed by the
-        # Manifest Reviewer to auto-fill its path box.
+        # CLAUDE-NOTE: Cross-tab path-propagation states. Producers
+        # (Triage / Ingest / Caption) push their just-written path here on
+        # success; consumers wire _wire_autofill on these states to fill
+        # their input fields unless the user has typed something else.
+        # Values are hydrated from .user_settings.json at demo.load() so
+        # they survive app restarts — see _hydrate_propagation_states below.
         last_manifest_state = gr.State("")
+        last_ingest_output_state = gr.State("")
+        last_caption_dir_state = gr.State("")
 
         # Landing / orientation.
         _tab_directions()
@@ -2181,22 +2311,44 @@ def build_ui() -> gr.Blocks:
         # Shared directory state + scaffold helper.
         work_dir, concepts_dir, output_dir = _tab_project()
 
-        # The Klippbok command tabs, in pipeline order. Triage and the
-        # Reviewer are the only tabs that need last_manifest_state, so the
-        # others stay on the uniform four-arg signature.
+        # The Klippbok command tabs, in pipeline order. Each tab receives
+        # only the propagation states it produces or consumes.
         _tab_scan(work_dir, concepts_dir, output_dir, api_state)
         _tab_triage(work_dir, concepts_dir, output_dir, api_state, last_manifest_state)
-        _tab_ingest(work_dir, concepts_dir, output_dir, api_state)
-        _tab_normalize(work_dir, concepts_dir, output_dir, api_state)
-        _tab_caption(work_dir, concepts_dir, output_dir, api_state)
-        _tab_score(work_dir, concepts_dir, output_dir, api_state)
-        _tab_extract(work_dir, concepts_dir, output_dir, api_state)
-        _tab_audit(work_dir, concepts_dir, output_dir, api_state)
-        _tab_validate(work_dir, concepts_dir, output_dir, api_state)
+        _tab_ingest(
+            work_dir, concepts_dir, output_dir, api_state,
+            last_manifest_state, last_ingest_output_state,
+        )
+        _tab_normalize(work_dir, concepts_dir, output_dir, api_state, last_ingest_output_state)
+        _tab_caption(
+            work_dir, concepts_dir, output_dir, api_state,
+            last_ingest_output_state, last_caption_dir_state,
+        )
+        _tab_score(work_dir, concepts_dir, output_dir, api_state, last_caption_dir_state)
+        _tab_extract(work_dir, concepts_dir, output_dir, api_state, last_ingest_output_state)
+        _tab_audit(work_dir, concepts_dir, output_dir, api_state, last_caption_dir_state)
+        _tab_validate(work_dir, concepts_dir, output_dir, api_state, last_ingest_output_state)
         _tab_organize(work_dir, concepts_dir, output_dir, api_state)
 
         # Manifest Reviewer — the whole reason this launcher exists.
         _tab_manifest_reviewer(last_manifest_state, work_dir)
+
+        # CLAUDE-NOTE: Hydrate propagation states from disk AFTER every tab
+        # has wired its .change() handler. demo.load() returning a new
+        # state value fires those handlers, so the consumer fields fill in
+        # on first render (tracker stays at "" initially, so the first
+        # autofill writes to empty fields as expected).
+        def _hydrate_propagation_states():
+            dp = _load_detected_paths()
+            return (
+                dp.get(_DETECTED_KEY_TRIAGE_MANIFEST, ""),
+                dp.get(_DETECTED_KEY_INGEST_OUTPUT, ""),
+                dp.get(_DETECTED_KEY_CAPTION_DIR, ""),
+            )
+        demo.load(
+            _hydrate_propagation_states,
+            outputs=[last_manifest_state, last_ingest_output_state, last_caption_dir_state],
+        )
 
         # API keys, install-check, python-exe override (polished in step 7).
         _tab_settings(api_state)
