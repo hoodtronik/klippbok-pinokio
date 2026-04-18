@@ -27,6 +27,7 @@ from typing import Iterator
 
 import gradio as gr
 
+import caption_images as caption_images_mod
 import manifest as mft
 import project_state as ps_mod
 import pipeline_installer as pi
@@ -1365,8 +1366,8 @@ def _tab_caption(
         s = _command_shell(
             tab_id,
             "klippbok.video caption",
-            "Generate `.txt` sidecar captions for each clip using a vision-language model. API keys live in the Settings tab.",
-            "Directory (positional) — clips to caption",
+            "Generate `.txt` sidecar captions for each clip (videos AND still images) using a vision-language model. Videos go through `klippbok.video caption`; still images (.png/.jpg/.jpeg/.webp) are sent directly to the same VLM via an in-process shim so image-model LoRA datasets (FLUX.2, Z-Image, Qwen-Image) work in the same Run. API keys live in the Settings tab.",
+            "Directory (positional) — clips or images to caption",
         )
         _sync(work_dir, s["directory"])
         dir_tracker = gr.State("")
@@ -1383,6 +1384,34 @@ def _tab_caption(
             with gr.Accordion("OpenAI-compatible / Ollama overrides", open=False):
                 base_url = gr.Textbox(label="--base-url", value="", info="e.g. http://localhost:11434/v1 for local Ollama.")
                 model = gr.Textbox(label="--model", value="", info="e.g. llama3.2-vision.")
+            # CLAUDE-NOTE: Image-only knobs — retry_delay only applies to
+            # the in-process image-captioning shim (Klippbok's video CLI
+            # has its own retry logic baked in). Surfaced here so free-
+            # tier users can tune for their provider's quota window.
+            with gr.Accordion("Image captioning (PNG/JPG) — rate-limit handling", open=False):
+                gr.Markdown(
+                    "When the target directory contains PNG / JPG / WEBP "
+                    "files, they're captioned in-process via Klippbok's VLM "
+                    "backends (video files still go through the "
+                    "`klippbok.video caption` CLI). A `.txt` sidecar next to "
+                    "each image is the completion marker — **re-running "
+                    "Caption just picks up where it left off**, so swapping "
+                    "a rate-limited API key in Settings and re-running is "
+                    "the supported recovery flow."
+                )
+                with gr.Row():
+                    retry_delay = gr.Number(
+                        label="--retry-delay (seconds)",
+                        value=60,
+                        precision=0,
+                        info="Wait this long before retrying after a 429 / quota error.",
+                    )
+                    max_retries = gr.Number(
+                        label="--max-retries",
+                        value=3,
+                        precision=0,
+                        info="Give up after this many retries on the same image.",
+                    )
 
         ps.register(
             "caption",
@@ -1390,13 +1419,29 @@ def _tab_caption(
             provider=provider, use_case=use_case, anchor=anchor,
             caption_fps=caption_fps, tags=tags, overwrite=overwrite,
             base_url=base_url, model=model,
+            retry_delay=retry_delay, max_retries=max_retries,
         )
         ps.register_run("caption", s["run_btn"])
 
-        def _run(directory, provider, use_case, anchor, caption_fps, tags, overwrite, base_url, model, dry, api):
+        def _run(directory, provider, use_case, anchor, caption_fps, tags, overwrite, base_url, model, retry_delay, max_retries, dry, api):
             if not directory:
                 yield "[error] Directory is required."
                 return
+
+            # CLAUDE-NOTE: Klippbok's `caption` CLI iterates video files
+            # only. Image-model LoRAs (FLUX.2 etc.) train on still frames,
+            # so we split the directory here: images go through the
+            # in-process shim (caption_images_mod), videos go through the
+            # existing subprocess CLI path. Both stream into the same log.
+            from pathlib import Path as _P
+            dir_p = _P(directory)
+            images = caption_images_mod.find_images(dir_p)
+            videos = caption_images_mod.find_videos(dir_p)
+            if not images and not videos:
+                yield f"[error] No images or videos found in {directory}"
+                return
+
+            # Build the video CLI cmd once (used for dry preview + run).
             cmd = _base_cmd("klippbok.video", "caption", directory)
             if provider:
                 cmd += ["--provider", provider]
@@ -1414,10 +1459,53 @@ def _tab_caption(
                 cmd += ["--base-url", base_url]
             if model:
                 cmd += ["--model", model]
+
             if dry:
-                yield _dry_preview(cmd)
+                preview = []
+                if images:
+                    preview.append(
+                        f"[image-caption] Would caption {len(images)} image(s) "
+                        f"via {provider or 'gemini'} (in-process shim)"
+                    )
+                if videos:
+                    preview.append("$ " + runner.format_command(cmd))
+                preview.append("[dry run — not executed]")
+                yield "\n".join(preview)
                 return
-            yield from _stream(tab_id, cmd, extra_env=api)
+
+            # Accumulating log buffer — Gradio replaces the textbox on each
+            # yield, so every emit must be the full history to date.
+            buf = ""
+
+            if images:
+                for line in caption_images_mod.caption_images(
+                    directory,
+                    provider=provider or "gemini",
+                    use_case=None if (not use_case or use_case == "(auto)") else use_case,
+                    anchor_word=anchor or None,
+                    tags=tags.split() if tags else None,
+                    overwrite=bool(overwrite),
+                    base_url=base_url or "",
+                    model=model or "",
+                    caption_fps=int(caption_fps) if caption_fps else 1,
+                    retry_delay=int(retry_delay) if retry_delay else caption_images_mod.DEFAULT_RETRY_DELAY,
+                    max_retries=int(max_retries) if max_retries else caption_images_mod.DEFAULT_MAX_RETRIES,
+                    extra_env=api,
+                ):
+                    buf += line + "\n"
+                    yield buf
+
+            if videos:
+                if images:
+                    buf += "\n"
+                    yield buf
+                for line in runner.stream_command(tab_id, cmd, extra_env=api):
+                    buf += line + "\n"
+                    yield buf
+            else:
+                # Images-only case — skip the subprocess entirely.
+                buf += "[image-caption] no video files in directory — skipping klippbok.video caption CLI\n"
+                yield buf
 
         def _after_run(directory: str, dry: bool, current: str, log: str):
             # CLAUDE-NOTE: Caption writes .txt sidecars in-place, so the
@@ -1434,7 +1522,7 @@ def _tab_caption(
 
         s["run_btn"].click(
             _run,
-            inputs=[s["directory"], provider, use_case, anchor, caption_fps, tags, overwrite, base_url, model, s["dry_run"], api_keys],
+            inputs=[s["directory"], provider, use_case, anchor, caption_fps, tags, overwrite, base_url, model, retry_delay, max_retries, s["dry_run"], api_keys],
             outputs=s["log"],
         ).then(
             _after_run,
