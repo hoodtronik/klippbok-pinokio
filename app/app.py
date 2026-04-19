@@ -114,13 +114,18 @@ TRAINER_PRESETS: dict[str, dict] = {
         "normalize_fps": 16,
         "caption_fps": 1,
         "frame_count_rule": "4n+1 (Wan / HunyuanVideo)",
+        # CLAUDE-NOTE: yaml_overrides are auto-written into
+        # <work_dir>/klippbok_data.yaml under `video.*` so Ingest (and
+        # any other tab whose CLI reads klippbok_data.yaml via --config)
+        # gets the preset's fps even though the flag isn't exposed.
+        # Keys here must be valid under klippbok.config.data_schema's
+        # VideoConfig — fps is any positive int; resolution is
+        # hard-validated to {480, 720}, so we only emit it when it fits.
+        "yaml_overrides": {"fps": 16, "resolution": 720},
         "guidance": (
             "**Wan 2.2** — fps **16**, resolution **480p or 720p (1280×720)**, "
             "frames must satisfy **4n+1** (5, 9, 13, …, 81). Spatial dims "
-            "divisible by 16. Resolution isn't a UI field — set it in "
-            "`klippbok_data.yaml` if you need to override the trainer's default. "
-            "The same yaml is how you override Ingest's fps; its CLI doesn't "
-            "accept --fps directly."
+            "divisible by 16."
         ),
     },
     "LTX-Video / LTX-2": {
@@ -129,12 +134,16 @@ TRAINER_PRESETS: dict[str, dict] = {
         "normalize_fps": 24,
         "caption_fps": 1,
         "frame_count_rule": "8n+1 (LTX)",
+        # Resolution omitted — LTX wants 704x480 / 768x768 etc but
+        # Klippbok's schema validator only accepts 480 or 720 in the
+        # `resolution` field. User can add a yaml override manually if
+        # they care (the launcher preserves unknown keys on re-write).
+        "yaml_overrides": {"fps": 24},
         "guidance": (
             "**LTX-Video / LTX-2** — fps **24** (community convention; the "
             "trainer doesn't pin it), resolution **768×768 / 704×480 / 1216×704**, "
             "frames must satisfy **8n+1** (9, 17, 25, …, 121, 161). Spatial "
-            "dims **must be divisible by 32** (hard VAE constraint). "
-            "Ingest's fps comes from `klippbok_data.yaml`, not a CLI flag."
+            "dims **must be divisible by 32** (hard VAE constraint)."
         ),
     },
     "HunyuanVideo": {
@@ -143,11 +152,11 @@ TRAINER_PRESETS: dict[str, dict] = {
         "normalize_fps": 24,
         "caption_fps": 1,
         "frame_count_rule": "4n+1 (Wan / HunyuanVideo)",
+        "yaml_overrides": {"fps": 24, "resolution": 720},
         "guidance": (
             "**HunyuanVideo** — fps **24**, resolution **544×960 or 720×1280**, "
             "frames **129** typical (4n+1 pattern, derived from the 3D VAE's "
-            "4× temporal compression). Spatial dims divisible by 16. "
-            "Ingest's fps comes from `klippbok_data.yaml`, not a CLI flag."
+            "4× temporal compression). Spatial dims divisible by 16."
         ),
     },
     "Image Models (FLUX / Z-Image / Qwen)": {
@@ -156,6 +165,9 @@ TRAINER_PRESETS: dict[str, dict] = {
         "normalize_fps": 16,       # not applicable
         "caption_fps": 1,
         "frame_count_rule": "image-only (skip frame check)",
+        # No yaml_overrides for image-only — there's no Klippbok
+        # video pipeline to configure, and writing a stale yaml would
+        # confuse downstream video tabs if the user switches presets.
         "guidance": (
             "**Image-model LoRAs** (FLUX.2 / Z-Image / Qwen-Image) — still "
             "images only. Skip Ingest / Normalize entirely; use the Caption "
@@ -2701,6 +2713,74 @@ def _tab_manifest_reviewer(last_manifest_state: gr.State, work_dir: gr.Textbox, 
 # ----- ui ------------------------------------------------------------------
 
 
+def _write_preset_yaml(
+    work_dir: str,
+    preset_name: str,
+    overrides: dict,
+) -> tuple[str, str]:
+    """Merge `overrides` into `<work_dir>/klippbok_data.yaml` under `video.*`.
+
+    Returns (yaml_path, error_message). Any existing yaml in that
+    location is round-tripped so user edits to other sections
+    (dataset, controls, quality, etc.) survive the preset change —
+    we only touch keys inside `video`.
+
+    Failure modes (empty yaml_path + non-empty error):
+      * work_dir is empty or not a directory
+      * the existing file is present but unreadable (permission)
+      * PyYAML raises on dump
+
+    On every other failure (corrupt yaml, missing file) we just
+    write a fresh one — this is a best-effort helper, not a
+    guaranteed persistence layer.
+    """
+    import yaml as _yaml
+
+    if not work_dir:
+        return "", ""  # no work_dir set yet — silent skip
+    dir_p = Path(work_dir)
+    if not dir_p.is_dir():
+        return "", f"not a directory: {work_dir}"
+
+    yaml_path = dir_p / "klippbok_data.yaml"
+    existing: dict = {}
+    if yaml_path.exists():
+        try:
+            with yaml_path.open(encoding="utf-8") as f:
+                loaded = _yaml.safe_load(f)
+            if isinstance(loaded, dict):
+                existing = loaded
+        except (OSError, _yaml.YAMLError):
+            # Corrupt or unreadable → overwrite fresh rather than fail.
+            existing = {}
+
+    video = existing.get("video")
+    if not isinstance(video, dict):
+        video = {}
+    for k, v in (overrides or {}).items():
+        video[k] = v
+    existing["video"] = video
+
+    header = (
+        f"# Auto-generated by klippbok-pinokio launcher.\n"
+        f"# Preset: {preset_name}\n"
+        f"# The launcher merges `video.*` on every Target Trainer preset\n"
+        f"# change; other sections (dataset, controls, quality, …) are\n"
+        f"# preserved if you've edited them.\n\n"
+    )
+    try:
+        body = _yaml.safe_dump(
+            existing,
+            sort_keys=True,
+            default_flow_style=False,
+            allow_unicode=True,
+        )
+        yaml_path.write_text(header + body, encoding="utf-8")
+    except (OSError, _yaml.YAMLError) as exc:
+        return "", f"write failed: {exc}"
+    return str(yaml_path), ""
+
+
 def _wire_project_persistence(
     *,
     demo: gr.Blocks,
@@ -2959,7 +3039,19 @@ def _wire_project_persistence(
             preset_components.append(comp)
             preset_keys.append(preset_key)
 
-    def _apply_preset(preset_name: str) -> tuple:
+    # CLAUDE-NOTE: Every video-path tab that takes --config to point at
+    # klippbok_data.yaml. When a preset has yaml_overrides, we write the
+    # yaml in work_dir and auto-fill these config fields so the next Run
+    # on any of these tabs picks it up. (Organize is excluded — its
+    # --config is for trainer layout, not dataset config.)
+    config_tabs = ("scan", "ingest", "normalize", "validate")
+    config_components: list[gr.components.Component] = []
+    for tab_id in config_tabs:
+        comp = ps.get_field(tab_id, "config")
+        if comp is not None:
+            config_components.append(comp)
+
+    def _apply_preset(preset_name: str, current_work_dir: str) -> tuple:
         # Defensive: unknown preset name leaves every field alone but
         # still updates the guidance markdown to match.
         spec = TRAINER_PRESETS.get(preset_name) or {}
@@ -2976,13 +3068,50 @@ def _wire_project_persistence(
                 ))
             else:
                 updates.append(gr.update())
+
+        # Write klippbok_data.yaml + push its path into every --config
+        # field. Skipped cleanly when the preset has no yaml_overrides
+        # (image-only preset) or when work_dir isn't set yet.
+        yaml_overrides = spec.get("yaml_overrides") or {}
+        yaml_path = ""
+        yaml_err = ""
+        if yaml_overrides:
+            yaml_path, yaml_err = _write_preset_yaml(
+                current_work_dir, preset_name, yaml_overrides,
+            )
+
+        config_updates: list = []
+        for _comp in config_components:
+            if yaml_path:
+                config_updates.append(gr.update(value=yaml_path))
+            else:
+                # Either no overrides (image preset) or write failed —
+                # leave whatever the user had in the field alone.
+                config_updates.append(gr.update())
+
         guidance = spec.get("guidance", "")
-        return (*updates, gr.update(value=guidance))
+        if yaml_path:
+            guidance += (
+                f"\n\n*Auto-wrote `{yaml_path}` with "
+                f"`video.{', video.'.join(f'{k}={v}' for k, v in yaml_overrides.items())}`. "
+                f"Ingest / Normalize / Scan / Validate `--config` fields "
+                f"point at it. Manual edits to other yaml sections are "
+                f"preserved on preset change.*"
+            )
+        elif yaml_overrides and not current_work_dir:
+            guidance += (
+                "\n\n*(Set a Working directory in the Project tab to "
+                "auto-generate `klippbok_data.yaml` for this preset.)*"
+            )
+        elif yaml_err:
+            guidance += f"\n\n*(Couldn't write yaml: {yaml_err})*"
+
+        return (*updates, *config_updates, gr.update(value=guidance))
 
     trainer_preset.change(
         _apply_preset,
-        inputs=trainer_preset,
-        outputs=[*preset_components, trainer_preset_info],
+        inputs=[trainer_preset, work_dir],
+        outputs=[*preset_components, *config_components, trainer_preset_info],
     )
 
 
