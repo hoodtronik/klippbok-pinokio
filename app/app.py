@@ -30,6 +30,7 @@ import gradio as gr
 import caption_images as caption_images_mod
 import manifest as mft
 import project_state as ps_mod
+import validate_images as validate_images_mod
 import pipeline_installer as pi
 import pipeline_setup as pipe
 import runner
@@ -83,6 +84,85 @@ training set is bounded by how well these images describe what you want.
 
 See the Directions tab in the Gradio UI for the full pipeline narrative.
 """
+
+
+# CLAUDE-NOTE: Target-trainer presets. Pure UI sugar — picking a preset
+# pushes default values into the Scan / Ingest / Normalize / Caption /
+# Validate fields so the user doesn't have to remember per-trainer
+# specs. Klippbok's CLI itself is preset-agnostic; it just receives
+# whatever flag values are in the fields at Run time.
+#
+# Spec sources (verified 2026-04-19, see commit message for full cites):
+#   * Wan 2.2 — fps=16, frames 4n+1 max 81 from
+#     env/Lib/site-packages/klippbok/config/defaults.py +
+#     Wan repo wan/configs/shared_config.py.
+#   * LTX-Video / LTX-2 — fps=24 (community convention; the trainer
+#     itself doesn't pin fps), spatial dims must be divisible by 32,
+#     frames 8n+1, max 121-161, from Lightricks/LTX-Video-Trainer
+#     docs/dataset-preparation.md.
+#   * HunyuanVideo — fps=24 (sample_video.py), frames 4n+1 (inferred
+#     from 3D VAE 4x temporal compression), 129 frames recommended,
+#     resolutions 544x960 / 720x1280 from Tencent-Hunyuan/HunyuanVideo
+#     official requirements table.
+#   * Image models — no fps / frame constraints; FLUX / Z-Image /
+#     Qwen-Image train at 1024-class resolutions by community
+#     convention.
+TRAINER_PRESETS: dict[str, dict] = {
+    "Wan 2.2": {
+        "scan_fps": 16,
+        "ingest_max_frames": 81,
+        "normalize_fps": 16,
+        "caption_fps": 1,
+        "frame_count_rule": "4n+1 (Wan / HunyuanVideo)",
+        "guidance": (
+            "**Wan 2.2** — fps **16**, resolution **480p or 720p (1280×720)**, "
+            "frames must satisfy **4n+1** (5, 9, 13, …, 81). Spatial dims "
+            "divisible by 16. Resolution isn't a UI field — set it in "
+            "`klippbok_data.yaml` if you need to override the trainer's default."
+        ),
+    },
+    "LTX-Video / LTX-2": {
+        "scan_fps": 24,
+        "ingest_max_frames": 121,
+        "normalize_fps": 24,
+        "caption_fps": 1,
+        "frame_count_rule": "8n+1 (LTX)",
+        "guidance": (
+            "**LTX-Video / LTX-2** — fps **24** (community convention; the "
+            "trainer doesn't pin it), resolution **768×768 / 704×480 / 1216×704**, "
+            "frames must satisfy **8n+1** (9, 17, 25, …, 121, 161). Spatial "
+            "dims **must be divisible by 32** (hard VAE constraint)."
+        ),
+    },
+    "HunyuanVideo": {
+        "scan_fps": 24,
+        "ingest_max_frames": 129,
+        "normalize_fps": 24,
+        "caption_fps": 1,
+        "frame_count_rule": "4n+1 (Wan / HunyuanVideo)",
+        "guidance": (
+            "**HunyuanVideo** — fps **24**, resolution **544×960 or 720×1280**, "
+            "frames **129** typical (4n+1 pattern, derived from the 3D VAE's "
+            "4× temporal compression). Spatial dims divisible by 16."
+        ),
+    },
+    "Image Models (FLUX / Z-Image / Qwen)": {
+        "scan_fps": 16,            # not applicable, but the field needs a number
+        "ingest_max_frames": 1,
+        "normalize_fps": 16,       # not applicable
+        "caption_fps": 1,
+        "frame_count_rule": "image-only (skip frame check)",
+        "guidance": (
+            "**Image-model LoRAs** (FLUX.2 / Z-Image / Qwen-Image) — still "
+            "images only. Skip Ingest / Normalize entirely; use the Caption "
+            "tab (auto-handles PNG/JPG via the in-process shim) and the "
+            "Validate tab (auto-detects image-only mode). 1024-class "
+            "resolutions are convention; divisibility by 16 is safe."
+        ),
+    },
+}
+
+DEFAULT_TRAINER_PRESET = "Wan 2.2"
 
 
 DIRECTIONS_MD = """\
@@ -982,6 +1062,28 @@ def _tab_project() -> dict:
         # without scrolling. Populated by the save/load wiring in build_ui.
         project_status = gr.Markdown(ps_mod.format_status("", "", []))
 
+        # CLAUDE-NOTE: Target-trainer preset selector. Pure UI sugar —
+        # picking a preset emits gr.update for default values across
+        # Scan / Ingest / Normalize / Caption / Validate (wiring in
+        # _wire_project_persistence). Klippbok's CLI itself stays
+        # preset-agnostic.
+        with gr.Row():
+            trainer_preset = gr.Dropdown(
+                label="Target trainer",
+                choices=list(TRAINER_PRESETS.keys()),
+                value=DEFAULT_TRAINER_PRESET,
+                interactive=True,
+                scale=2,
+                info=(
+                    "Sets default fps, max-frames, and frame-count rule "
+                    "for the selected trainer. You can still override "
+                    "individual settings per-tab."
+                ),
+            )
+        trainer_preset_info = gr.Markdown(
+            TRAINER_PRESETS[DEFAULT_TRAINER_PRESET]["guidance"]
+        )
+
         with gr.Row():
             load_project_btn = gr.Button("Load Project", scale=0, size="sm")
             new_project_btn = gr.Button("New Project", scale=0, size="sm")
@@ -1062,6 +1164,8 @@ def _tab_project() -> dict:
         "load_project_btn": load_project_btn,
         "new_project_btn": new_project_btn,
         "recent_dropdown": recent_dropdown,
+        "trainer_preset": trainer_preset,
+        "trainer_preset_info": trainer_preset_info,
     }
 
 
@@ -1678,8 +1782,8 @@ def _tab_validate(work_dir, _concepts, _output, _api, last_ingest_output_state: 
         s = _command_shell(
             tab_id,
             "klippbok.dataset validate",
-            "Check dataset completeness and quality. Takes either a dataset folder or a `klippbok_data.yaml` config path as the positional argument.",
-            "Path (positional) — dataset folder or klippbok_data.yaml",
+            "Check dataset completeness and quality. Auto-detects whether the target is a **video**, **image**, or **mixed** dataset — image datasets (PNG/JPG frames + .txt captions) are handled by an in-process launcher shim so you don't get spurious 'no matching target video' errors. Videos still flow through `klippbok.dataset validate`.",
+            "Path (positional) — dataset folder (images or videos) or klippbok_data.yaml",
         )
         _sync(work_dir, s["directory"])
         dir_tracker = gr.State("")
@@ -1693,19 +1797,59 @@ def _tab_validate(work_dir, _concepts, _output, _api, last_ingest_output_state: 
                 duplicates = gr.Checkbox(label="--duplicates", value=False, info="Perceptual duplicate detection.")
                 json_out = gr.Checkbox(label="--json", value=False, info="Emit JSON instead of formatted report.")
             config = gr.Textbox(label="--config (optional)", info="Path to klippbok_data.yaml override.", value="")
+            # CLAUDE-NOTE: Frame-count rule — set automatically by the
+            # Project tab's Target Trainer preset. The shim emits a
+            # notice for the chosen rule so users see what the dataset
+            # is being held to (enforcement still flows through Klippbok
+            # for video-only dirs).
+            frame_count_rule = gr.Dropdown(
+                label="Frame count rule",
+                choices=[
+                    "off",
+                    "4n+1 (Wan / HunyuanVideo)",
+                    "8n+1 (LTX)",
+                    "image-only (skip frame check)",
+                ],
+                value="4n+1 (Wan / HunyuanVideo)",
+                info="Auto-set by the Project tab's Target Trainer preset.",
+            )
 
         ps.register(
             "validate",
             directory=s["directory"], dry_run=s["dry_run"],
             manifest=manifest, buckets=buckets, quality=quality,
             duplicates=duplicates, json_out=json_out, config=config,
+            frame_count_rule=frame_count_rule,
         )
         ps.register_run("validate", s["run_btn"])
 
-        def _run(path, manifest, buckets, quality, duplicates, json_out, config, dry):
+        def _run(path, manifest, buckets, quality, duplicates, json_out, config, frame_count_rule, dry):
             if not path:
                 yield "[error] Path is required."
                 return
+
+            # CLAUDE-NOTE: Auto-route based on dir contents. Klippbok's
+            # CLI hardcodes video extensions when discovering "target"
+            # files (discover.py VIDEO_EXTENSIONS), so image-only /
+            # mixed datasets falsely report every file as orphaned.
+            # We branch:
+            #   * images-only or mixed → launcher shim handles pairing +
+            #     image quality + duplicates; bucket/frame/fps checks
+            #     skip (video-specific — user can re-run on a videos-
+            #     only dir for those)
+            #   * videos-only → Klippbok CLI unchanged
+            #   * yaml config path → Klippbok CLI (config semantics
+            #     aren't something the shim reproduces)
+            from pathlib import Path as _P
+            path_p = _P(path)
+            is_yaml = path_p.is_file() and path_p.suffix.lower() in (".yaml", ".yml")
+            kind = (
+                "config" if is_yaml
+                else validate_images_mod.classify_directory(path_p)
+                if path_p.is_dir()
+                else "unknown"
+            )
+
             cmd = _base_cmd("klippbok.dataset", "validate", path)
             if manifest:
                 cmd.append("--manifest")
@@ -1719,14 +1863,52 @@ def _tab_validate(work_dir, _concepts, _output, _api, last_ingest_output_state: 
                 cmd.append("--json")
             if config:
                 cmd += ["--config", config]
+
             if dry:
-                yield _dry_preview(cmd)
+                preview = [f"[validate] Auto-detected kind: {kind}"]
+                if kind in ("images", "mixed"):
+                    preview.append(
+                        f"[validate-images] Would validate {kind} dataset "
+                        f"via launcher shim (quality={bool(quality)}, "
+                        f"duplicates={bool(duplicates)}, json={bool(json_out)})"
+                    )
+                    if buckets:
+                        preview.append(
+                            "[validate-images] --buckets is video-specific, "
+                            "skipping for image/mixed datasets"
+                        )
+                if kind in ("videos", "config", "unknown"):
+                    preview.append("$ " + runner.format_command(cmd))
+                preview.append("[dry run — not executed]")
+                yield "\n".join(preview)
                 return
+
+            if kind in ("images", "mixed"):
+                if buckets:
+                    yield (
+                        "[validate-images] --buckets is video-specific — "
+                        "skipping for image/mixed dataset."
+                    )
+                buf = ""
+                for line in validate_images_mod.validate_directory(
+                    path,
+                    quality=bool(quality),
+                    duplicates=bool(duplicates),
+                    json_output=bool(json_out),
+                    write_manifest=bool(manifest),
+                    frame_count_rule=frame_count_rule or "off",
+                ):
+                    buf += line + "\n"
+                    yield buf
+                return
+
+            # Videos-only, yaml config, or path that doesn't exist —
+            # fall through to Klippbok's CLI and let it report.
             yield from _stream(tab_id, cmd)
 
         s["run_btn"].click(
             _run,
-            inputs=[s["directory"], manifest, buckets, quality, duplicates, json_out, config, s["dry_run"]],
+            inputs=[s["directory"], manifest, buckets, quality, duplicates, json_out, config, frame_count_rule, s["dry_run"]],
             outputs=s["log"],
         )
 
@@ -2521,6 +2703,8 @@ def _wire_project_persistence(
     recent_dropdown: gr.Dropdown,
     load_project_btn: gr.Button,
     new_project_btn: gr.Button,
+    trainer_preset: gr.Dropdown,
+    trainer_preset_info: gr.Markdown,
 ) -> None:
     """Install auto-save, auto-load, and project-management wiring.
 
@@ -2740,6 +2924,47 @@ def _wire_project_persistence(
     # check — kept explicit so future edits notice if they drift).
     assert _load_tail_size == 2, "load_outputs tail size mismatch"
 
+    # ----- TRAINER-PRESET wiring ------------------------------------------
+    # CLAUDE-NOTE: Pure UI-side feature. Picking a Target Trainer in the
+    # Project tab pushes default values across Scan / Ingest / Normalize /
+    # Caption / Validate. Klippbok's CLI is preset-agnostic — it just
+    # receives whatever flag values are in the fields at Run time. The
+    # auto-save pipeline picks up these field changes the same way it
+    # would for a manual edit, so the preset survives across reloads.
+    preset_targets = [
+        ("scan", "fps", "scan_fps"),
+        ("ingest", "max_frames", "ingest_max_frames"),
+        ("normalize", "fps", "normalize_fps"),
+        ("caption", "caption_fps", "caption_fps"),
+        ("validate", "frame_count_rule", "frame_count_rule"),
+    ]
+    preset_components: list[gr.components.Component] = []
+    preset_keys: list[str] = []
+    for tab_id, field_name, preset_key in preset_targets:
+        comp = ps.get_field(tab_id, field_name)
+        if comp is not None:
+            preset_components.append(comp)
+            preset_keys.append(preset_key)
+
+    def _apply_preset(preset_name: str) -> tuple:
+        # Defensive: unknown preset name leaves every field alone but
+        # still updates the guidance markdown to match.
+        spec = TRAINER_PRESETS.get(preset_name) or {}
+        updates: list = []
+        for key in preset_keys:
+            if key in spec:
+                updates.append(gr.update(value=spec[key]))
+            else:
+                updates.append(gr.update())
+        guidance = spec.get("guidance", "")
+        return (*updates, gr.update(value=guidance))
+
+    trainer_preset.change(
+        _apply_preset,
+        inputs=trainer_preset,
+        outputs=[*preset_components, trainer_preset_info],
+    )
+
 
 def build_ui() -> gr.Blocks:
     with gr.Blocks(title="Klippbok", analytics_enabled=False) as demo:
@@ -2829,6 +3054,8 @@ def build_ui() -> gr.Blocks:
             recent_dropdown=project_ui["recent_dropdown"],
             load_project_btn=project_ui["load_project_btn"],
             new_project_btn=project_ui["new_project_btn"],
+            trainer_preset=project_ui["trainer_preset"],
+            trainer_preset_info=project_ui["trainer_preset_info"],
         )
 
     return demo

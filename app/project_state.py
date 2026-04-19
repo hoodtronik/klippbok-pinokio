@@ -65,6 +65,15 @@ class ProjectState:
     def run_buttons(self) -> dict[str, gr.Button]:
         return dict(self._run_buttons)
 
+    def get_field(self, tab_id: str, field_name: str) -> gr.components.Component | None:
+        """Look up a registered component by (tab_id, field_name).
+
+        Returns None if either the tab or the field hasn't been
+        registered yet. Used by build_ui's preset wiring to grab the
+        cross-tab handles it needs to update on dropdown change.
+        """
+        return self._fields.get(tab_id, {}).get(field_name)
+
     def ordered_components(self) -> list[gr.components.Component]:
         out: list[gr.components.Component] = []
         for tab_id in sorted(self._fields):
