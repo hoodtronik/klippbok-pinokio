@@ -110,7 +110,6 @@ See the Directions tab in the Gradio UI for the full pipeline narrative.
 TRAINER_PRESETS: dict[str, dict] = {
     "Wan 2.2": {
         "scan_fps": 16,
-        "ingest_fps": 16,
         "ingest_max_frames": 81,
         "normalize_fps": 16,
         "caption_fps": 1,
@@ -119,12 +118,13 @@ TRAINER_PRESETS: dict[str, dict] = {
             "**Wan 2.2** — fps **16**, resolution **480p or 720p (1280×720)**, "
             "frames must satisfy **4n+1** (5, 9, 13, …, 81). Spatial dims "
             "divisible by 16. Resolution isn't a UI field — set it in "
-            "`klippbok_data.yaml` if you need to override the trainer's default."
+            "`klippbok_data.yaml` if you need to override the trainer's default. "
+            "The same yaml is how you override Ingest's fps; its CLI doesn't "
+            "accept --fps directly."
         ),
     },
     "LTX-Video / LTX-2": {
         "scan_fps": 24,
-        "ingest_fps": 24,
         "ingest_max_frames": 121,
         "normalize_fps": 24,
         "caption_fps": 1,
@@ -133,12 +133,12 @@ TRAINER_PRESETS: dict[str, dict] = {
             "**LTX-Video / LTX-2** — fps **24** (community convention; the "
             "trainer doesn't pin it), resolution **768×768 / 704×480 / 1216×704**, "
             "frames must satisfy **8n+1** (9, 17, 25, …, 121, 161). Spatial "
-            "dims **must be divisible by 32** (hard VAE constraint)."
+            "dims **must be divisible by 32** (hard VAE constraint). "
+            "Ingest's fps comes from `klippbok_data.yaml`, not a CLI flag."
         ),
     },
     "HunyuanVideo": {
         "scan_fps": 24,
-        "ingest_fps": 24,
         "ingest_max_frames": 129,
         "normalize_fps": 24,
         "caption_fps": 1,
@@ -146,22 +146,16 @@ TRAINER_PRESETS: dict[str, dict] = {
         "guidance": (
             "**HunyuanVideo** — fps **24**, resolution **544×960 or 720×1280**, "
             "frames **129** typical (4n+1 pattern, derived from the 3D VAE's "
-            "4× temporal compression). Spatial dims divisible by 16."
+            "4× temporal compression). Spatial dims divisible by 16. "
+            "Ingest's fps comes from `klippbok_data.yaml`, not a CLI flag."
         ),
     },
     "Image Models (FLUX / Z-Image / Qwen)": {
         "scan_fps": 16,            # not applicable, but the field needs a number
-        "ingest_fps": 16,          # disabled for this preset — see `disabled_fields`
         "ingest_max_frames": 1,
         "normalize_fps": 16,       # not applicable
         "caption_fps": 1,
         "frame_count_rule": "image-only (skip frame check)",
-        # CLAUDE-NOTE: `disabled_fields` is a UI-only hint consumed by
-        # _apply_preset — it emits interactive=False for listed fields so
-        # users don't get confused entering values that won't be used.
-        # Only Ingest --fps right now; extend the list if more fields
-        # become nonsensical for image-only datasets.
-        "disabled_fields": ["ingest_fps"],
         "guidance": (
             "**Image-model LoRAs** (FLUX.2 / Z-Image / Qwen-Image) — still "
             "images only. Skip Ingest / Normalize entirely; use the Caption "
@@ -1343,14 +1337,15 @@ def _tab_ingest(
             with gr.Row():
                 threshold = gr.Number(label="--threshold", value=27.0, precision=1, info="Scene detection threshold.")
                 max_frames = gr.Number(label="--max-frames", value=81, precision=0, info="Max frames per clip (0 = no limit). 81 ≈ 5s @ 16fps.")
-                # CLAUDE-NOTE: --fps was missing from the Ingest tab even
-                # though Klippbok's ingest CLI accepts it; that broke the
-                # Target Trainer preset for LTX / HunyuanVideo (both need
-                # 24). Default 16 matches Wan 2.2; the preset dropdown
-                # pushes per-trainer values in (and disables for the
-                # image-only preset).
-                fps = gr.Number(label="--fps", value=16, precision=0, info="Target output frame rate.")
-            config = gr.Textbox(label="--config (optional)", info="Path to klippbok_data.yaml.", value="")
+            # CLAUDE-NOTE: `klippbok.video ingest` does NOT accept --fps
+            # as a CLI flag (verified against `python -m klippbok.video
+            # ingest --help` — the only flags are --output / --config /
+            # --threshold / --max-frames / --triage / --caption /
+            # --provider). To change output fps during ingest, the user
+            # supplies --config klippbok_data.yaml with an fps override.
+            # The Target Trainer preset therefore pushes its fps value
+            # to Scan + Normalize only (not Ingest).
+            config = gr.Textbox(label="--config (optional)", info="Path to klippbok_data.yaml — use this to override the default fps (16) during ingest.", value="")
             triage = gr.Textbox(label="--triage MANIFEST (optional)", info="scene_triage_manifest.json — only split scenes marked include:true.", value="")
             with gr.Row():
                 caption = gr.Checkbox(label="--caption", value=False, info="Auto-caption each clip after splitting.", scale=0)
@@ -1365,12 +1360,12 @@ def _tab_ingest(
             "ingest",
             directory=s["directory"], dry_run=s["dry_run"],
             output=output, config=config, threshold=threshold,
-            max_frames=max_frames, fps=fps,
+            max_frames=max_frames,
             triage=triage, caption=caption, provider=provider,
         )
         ps.register_run("ingest", s["run_btn"])
 
-        def _run(video, output, config, threshold, max_frames, fps, triage, caption, provider, dry, api):
+        def _run(video, output, config, threshold, max_frames, triage, caption, provider, dry, api):
             if not video:
                 yield "[error] Video path is required."
                 return
@@ -1384,8 +1379,6 @@ def _tab_ingest(
                 cmd += ["--threshold", str(float(threshold))]
             if max_frames is not None:
                 cmd += ["--max-frames", str(int(max_frames))]
-            if fps:
-                cmd += ["--fps", str(int(fps))]
             if triage:
                 cmd += ["--triage", triage]
             if caption:
@@ -1415,7 +1408,7 @@ def _tab_ingest(
 
         s["run_btn"].click(
             _run,
-            inputs=[s["directory"], output, config, threshold, max_frames, fps, triage, caption, provider, s["dry_run"], _api],
+            inputs=[s["directory"], output, config, threshold, max_frames, triage, caption, provider, s["dry_run"], _api],
             outputs=s["log"],
         ).then(
             _after_run,
@@ -2953,7 +2946,6 @@ def _wire_project_persistence(
     # would for a manual edit, so the preset survives across reloads.
     preset_targets = [
         ("scan", "fps", "scan_fps"),
-        ("ingest", "fps", "ingest_fps"),
         ("ingest", "max_frames", "ingest_max_frames"),
         ("normalize", "fps", "normalize_fps"),
         ("caption", "caption_fps", "caption_fps"),
